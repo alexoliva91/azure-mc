@@ -236,29 +236,49 @@ def parse_extrap(filepath: str) -> np.ndarray:
 
 
 # -------------------------------------------------------------------
-# Parse AZURE2 chiSquared.out
+# Parse AZURE2 .out output ("Calculate With Data" mode)
 # -------------------------------------------------------------------
 
-def parse_chi_squared(filepath: str) -> Optional[float]:
-    """Read total chi-squared from AZURE2's ``chiSquared.out``.
+def parse_output_file(filepath: str) -> Optional[np.ndarray]:
+    """Parse an AZURE2 ``AZUREOut_aa=*_R=*.out`` file.
 
-    The file lists χ²/N per segment; the **last** non-empty line
-    contains the total χ² of the calculation.
+    The ``.out`` format (see AZURE2 manual §8) has multiple data sets
+    separated by double blank lines.  Each row has 9 columns:
+
+    =====  ====================================
+    Col 0  CoM Energy (MeV)
+    Col 1  Excitation Energy (MeV)
+    Col 2  CoM Angle (degrees)
+    Col 3  Calculated Cross Section (fit) (b)
+    Col 4  Calculated S-factor (fit) (MeV b)
+    Col 5  Data Cross Section (b)
+    Col 6  Data Cross Section Uncertainty (b)
+    Col 7  Data S-factor (MeV b)
+    Col 8  Data S-factor Uncertainty (MeV b)
+    =====  ====================================
+
+    Returns
+    -------
+    np.ndarray, shape (n_pts, 9) | None
+        All data rows concatenated.  *None* if file missing / empty.
     """
     if not os.path.isfile(filepath):
         return None
-    last_value: Optional[float] = None
+    rows: list[list[float]] = []
     with open(filepath, "r") as fh:
         for line in fh:
             stripped = line.strip()
             if not stripped:
                 continue
-            try:
-                parts = stripped.split()
-                last_value = float(parts[-1])
-            except (ValueError, IndexError):
-                continue
-    return last_value
+            parts = stripped.split()
+            if len(parts) >= 9:
+                try:
+                    rows.append([float(p) for p in parts[:9]])
+                except ValueError:
+                    continue
+    if not rows:
+        return None
+    return np.array(rows)
 
 
 def get_data_output_files(contents: list[str]) -> list[str]:
@@ -295,13 +315,16 @@ def resolve_data_paths(contents: list[str], azr_base_dir: str) -> list[str]:
         line = contents[i]
         if not line.strip():
             continue
-        parts = line.split()
-        if len(parts) > DATA_FILEPATH_INDEX:
-            filepath = parts[DATA_FILEPATH_INDEX]
+        leading = line[:len(line) - len(line.lstrip())]
+        parts = re.split(r'(\s+)', line.lstrip())
+        # parts layout: [tok0, ws0, tok1, ws1, ...]
+        tok_pos = 2 * DATA_FILEPATH_INDEX
+        if tok_pos < len(parts):
+            filepath = parts[tok_pos]
             if not os.path.isabs(filepath):
                 abs_path = os.path.normpath(
                     os.path.join(azr_base_dir, filepath)
                 )
-                # Replace the filepath token (always the last token)
-                contents[i] = line[: line.rfind(filepath)] + abs_path
+                parts[tok_pos] = abs_path
+                contents[i] = leading + ''.join(parts)
     return contents

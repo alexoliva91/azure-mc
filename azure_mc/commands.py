@@ -15,7 +15,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from .io import read_input_file, read_levels, get_extrap_output_files, resolve_data_paths
+from .io import (read_input_file, read_levels, get_extrap_output_files,
+                 get_data_output_files, resolve_data_paths)
 from .parameters import (
     discover_free_parameters, get_input_values, sample_theta,
     log_prior, initialize_walkers,
@@ -60,11 +61,15 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
     for j, nf in enumerate(norms):
         idx = n_level_params + j
         nom = values[idx]
+        if nom != 0:
+            lo_n, hi_n = nom * 0.8, nom * 1.2
+        else:
+            lo_n, hi_n = -1.0, 1.0
         param_entries[nf.key()] = {
             "description": nf.description(),
             "nominal": float(nom),
-            "low": float(nom * 0.8),
-            "high": float(nom * 1.2),
+            "low": float(lo_n),
+            "high": float(hi_n),
             "distribution": "uniform",
         }
 
@@ -93,7 +98,7 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         "use_brune": True,
         "use_gsl": True,
         "n_samples": 100,
-        "max_workers": 4,
+        "max_workers": os.cpu_count(),
         "seed": 42,
         "keep_tmp": False,
         "timeout": 600,
@@ -154,7 +159,7 @@ def cmd_run(
         cfg = yaml.safe_load(fh) or {}
 
     n_samples = cfg.get("n_samples", 100)
-    max_workers = cfg.get("max_workers", 4)
+    max_workers = cfg.get("max_workers", os.cpu_count())
     azure2_cmd = cfg.get("azure2_exe", "AZURE2")
     if not shutil.which(azure2_cmd):
         log.error("AZURE2 executable '%s' not found in PATH. "
@@ -212,21 +217,8 @@ def cmd_run(
         log.warning("Params in .azr not found in YAML (using defaults): %s",
                     sorted(missing))
 
-    ranges: list[dict] = []
-    for i, key in enumerate(all_keys):
-        nom = nominals[i]
-        if key in user_params:
-            r = dict(user_params[key])
-            if "low" not in r or "high" not in r:
-                half = abs(nom) * default_frac if nom != 0 else 1.0
-                r.setdefault("low", nom - half)
-                r.setdefault("high", nom + half)
-            r.setdefault("distribution", default_dist)
-        else:
-            half = abs(nom) * default_frac if nom != 0 else 1.0
-            r = {"low": nom - half, "high": nom + half,
-                 "distribution": default_dist}
-        ranges.append(r)
+    ranges = _build_ranges(all_keys, nominals, user_params,
+                           default_frac, default_dist)
 
     # Sampling
     rng = np.random.default_rng(seed)
@@ -300,8 +292,7 @@ def cmd_run(
                 if shutdown_requested:
                     log.warning("Cancelling remaining %d runs...",
                                 n_samples - done)
-                    for pending in futures:
-                        pending.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
                     break
     finally:
         signal.signal(signal.SIGINT, old_sigint)
@@ -610,7 +601,7 @@ def cmd_mcmc(
         sys.exit(1)
     use_brune = cfg.get("use_brune", True)
     use_gsl = cfg.get("use_gsl", True)
-    max_workers = cfg.get("max_workers", 4)
+    max_workers = cfg.get("max_workers", os.cpu_count())
     seed = cfg.get("seed", 42)
     timeout = cfg.get("timeout", 600)
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
@@ -647,6 +638,7 @@ def cmd_mcmc(
     levels = read_levels(contents)
     n_level = len(params)
     ndim = len(nominals)
+    data_output_files = get_data_output_files(contents)
 
     all_keys = [p.key() for p in params] + [nf.key() for nf in norms]
     ranges = _build_ranges(all_keys, nominals, user_params,
@@ -658,10 +650,15 @@ def cmd_mcmc(
         n_walkers = 2 * ndim + 2
         log.warning("n_walkers (%d) < 2*ndim (%d).  Increased to %d.",
                     old_nw, 2 * ndim, n_walkers)
+    if not data_output_files:
+        log.error("No <segmentsData> found in %s — "
+                  "no data to fit against.", azr_filepath)
+        sys.exit(1)
 
     log.info("MCMC setup  : %d walkers, %d steps, %d params (n_burn=%d, thin=%d)",
              n_walkers, n_steps, ndim, n_burn, thin)
     log.info("  Level params: %d,  Norm factors: %d", n_level, len(norms))
+    log.info("  Data output files: %s", data_output_files)
 
     # ---- initialise walkers ----
     rng = np.random.default_rng(seed)
@@ -680,7 +677,7 @@ def cmd_mcmc(
     # ---- run sampler ----
     lp_args = (
         contents, levels, addresses, ranges,
-        n_level, norms,
+        n_level, norms, data_output_files,
         azure2_cmd, use_brune, use_gsl, base_tmp, timeout,
     )
 
@@ -696,6 +693,7 @@ def cmd_mcmc(
     old_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
     old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
 
+    pool = None
     try:
         if max_workers > 1:
             pool = Pool(max_workers)
@@ -704,7 +702,6 @@ def cmd_mcmc(
                 args=lp_args, pool=pool,
             )
         else:
-            pool = None
             sampler = emcee.EnsembleSampler(
                 n_walkers, ndim, log_probability,
                 args=lp_args,
@@ -716,12 +713,18 @@ def cmd_mcmc(
             if shutdown_requested:
                 log.warning("Stopping MCMC early at step %d.", sampler.iteration)
                 break
-    finally:
-        signal.signal(signal.SIGINT, old_sigint)
-        signal.signal(signal.SIGTERM, old_sigterm)
+    except BaseException:
         if pool is not None:
             pool.terminate()
             pool.join()
+        raise
+    else:
+        if pool is not None:
+            pool.close()
+            pool.join()
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
 
     n_completed = sampler.iteration
     log.info("MCMC completed %d/%d steps.  Mean acceptance: %.3f",
@@ -914,8 +917,7 @@ def cmd_mcmc_predict(
                     log.info("  Progress: %d/%d  (%d ok, %d failed)",
                              done, n_draws, len(results_dict), n_failed)
                 if shutdown_requested:
-                    for pending in futures:
-                        pending.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
                     break
     finally:
         signal.signal(signal.SIGINT, old_sigint)

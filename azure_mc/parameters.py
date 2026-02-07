@@ -33,7 +33,7 @@ def discover_free_parameters(
 
     for gi, group in enumerate(levels):
         first = group[0]
-        jpi = first.spin * first.parity
+        jpi = (first.spin, first.parity)
         jpis.append(jpi)
         rank = jpis.count(jpi)
 

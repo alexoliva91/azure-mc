@@ -28,7 +28,7 @@ class Level:
         self.energy = float(row[ENERGY_INDEX])
         self.energy_fixed = int(row[ENERGY_FIXED_INDEX])
         self.width = float(row[WIDTH_INDEX])
-        self.width_fixed = int(int(row[WIDTH_FIXED_INDEX]) or self.width == 0)
+        self.width_fixed = int(row[WIDTH_FIXED_INDEX]) != 0 or self.width == 0
         self.channel_radius = float(row[CHANNEL_RADIUS_INDEX])
         self.channel = int(row[CHANNEL_INDEX])
         self.separation_energy = float(row[SEPARATION_ENERGY_INDEX])
