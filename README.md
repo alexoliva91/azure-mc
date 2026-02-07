@@ -9,7 +9,7 @@ Supports two modes of operation:
 2. **MCMC (fit to data)** — uses the [emcee](https://emcee.readthedocs.io/)
    ensemble sampler to explore the posterior distribution of R-matrix
    parameters by evaluating the χ² likelihood via AZURE2's
-   *Calculate With Data* mode.  The parameter ranges in `mc_params.yaml`
+   *Calculate With Data* mode.  The parameter ranges in `parameters.yaml`
    serve as priors.
 
 The classes and functions in this package are inspired by those of
@@ -48,56 +48,61 @@ azure_mc/                # Package
 
 ## Usage
 
-The tool can be invoked in two ways:
-
 ```bash
-python azure_mc.py <command> ...
-# or
-python -m azure_mc <command> ...
+python -m azure_mc <command> [subcommand] [options]
 ```
+
+For backwards compatibility, `python azure_mc.py ...` also works.
+
+Commands:
+
+| Command | Description |
+|---------|-------------|
+| `populate -i FILE` | Discover free parameters → YAML config files |
+| `mc extrapolate` | Sample parameters randomly and extrapolate |
+| `mc summary` | Inspect random-MC results |
+| `mcmc fit` | Fit parameters to data via MCMC |
+| `mcmc extrapolate` | Extrapolate using posterior samples |
+| `mcmc summary` | Inspect MCMC / extrapolation results |
 
 ### Workflow A — Random MC (extrapolation without data)
 
 #### Step 1: Discover parameters
 
 ```bash
-python azure_mc.py populate input.azr
+python -m azure_mc populate -i input.azr
 ```
 
 This creates two files:
-- `mc_setup.yaml` — run configuration (n_samples, workers, quantiles, MCMC settings, …)
-- `mc_params.yaml` — per-parameter ranges and distributions
+- `setup.yaml` — run configuration (n_samples, workers, quantiles, MCMC settings, …)
+- `parameters.yaml` — per-parameter ranges and distributions
 
 #### Step 2: Edit parameter ranges
 
-Edit `mc_params.yaml` to adjust the sampling ranges, distributions, and
+Edit `parameters.yaml` to adjust the sampling ranges, distributions, and
 sigma values for each free parameter.
 
-#### Step 3: Run Monte Carlo
+#### Step 3: Extrapolate
 
 ```bash
-python azure_mc.py run input.azr mc_setup.yaml
+python -m azure_mc mc extrapolate -i input.azr -c setup.yaml
 ```
 
 #### Step 4: Inspect results
 
 ```bash
-python azure_mc.py summary mc_results.npz
+python -m azure_mc mc summary -r mc_extrapolate.npz
 ```
 
 #### Step 5 (optional): Recompute quantiles
 
-Generate `.dat` files for different quantile levels without re-running the MC:
+Pass `-q` to `summary` to also write `.dat` files:
 
 ```bash
-# Specify quantiles directly:
-python azure_mc.py quantiles mc_results.npz -q 0.025 0.5 0.975
+python -m azure_mc mc summary -r mc_extrapolate.npz -q 0.025 0.5 0.975
 
-# Or read quantiles from the setup YAML:
-python azure_mc.py quantiles mc_results.npz -c mc_setup.yaml
-
-# Optionally set a custom output file prefix:
-python azure_mc.py quantiles mc_results.npz -q 0.16 0.84 -p my_prefix
+# With a custom output file prefix:
+python -m azure_mc mc summary -r mc_extrapolate.npz -q 0.16 0.84 -p my_prefix
 ```
 
 ### Workflow B — MCMC (fit to experimental data)
@@ -105,25 +110,25 @@ python azure_mc.py quantiles mc_results.npz -q 0.16 0.84 -p my_prefix
 This mode uses [emcee](https://emcee.readthedocs.io/) to perform a Markov
 Chain Monte Carlo exploration of the parameter posterior, using AZURE2's
 *Calculate With Data* mode to evaluate the χ² likelihood at each proposed
-parameter vector.  The ranges/distributions in `mc_params.yaml` serve as
+parameter vector.  The ranges/distributions in `parameters.yaml` serve as
 **priors** (uniform → flat prior within bounds; gaussian → Gaussian prior
 centered on `nominal` with width `sigma`, hard-bounded by `low`/`high`).
 
 #### Step 1: Discover parameters
 
 ```bash
-python azure_mc.py populate input.azr
+python -m azure_mc populate -i input.azr
 ```
 
 #### Step 2: Edit priors
 
-Edit `mc_params.yaml`.  For MCMC the `low`/`high` bounds are hard prior
+Edit `parameters.yaml`.  For MCMC the `low`/`high` bounds are hard prior
 boundaries.  Use `distribution: gaussian` with a `sigma` key for
 informative priors.
 
 #### Step 3: (Optional) Tune MCMC settings
 
-In `mc_setup.yaml`, edit the `mcmc` section:
+In `setup.yaml`, edit the `mcmc` section:
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -132,39 +137,39 @@ In `mc_setup.yaml`, edit the `mcmc` section:
 | `n_burn` | `200` | Burn-in steps to discard |
 | `thin` | `1` | Thinning factor |
 | `init_spread` | `1e-4` | Initial ball spread (fraction of range) |
-| `output_file` | `mcmc_results.npz` | Chain output file |
-| `predict_output_file` | `mcmc_predict.npz` | Posterior prediction output |
+| `output_file` | `mcmc_chain.npz` | Chain output file |
+| `extrapolate_output_file` | `mcmc_extrapolate.npz` | Posterior extrapolation output |
 | `progress` | `true` | Show progress bar (requires tqdm) |
 
-#### Step 4: Run MCMC
+#### Step 4: Fit
 
 ```bash
-python azure_mc.py mcmc input.azr mc_setup.yaml
+python -m azure_mc mcmc fit -i input.azr -c setup.yaml
 ```
 
-The output `mcmc_results.npz` contains:
+The output `mcmc_chain.npz` contains:
 - `chain` — full chain `(n_steps, n_walkers, n_params)`
 - `flat_chain` — flattened chain after burn-in/thinning
 - `log_prob` — log-posterior values
 - `acceptance_fraction`, `autocorr_time`
 - `posterior_quantiles` — parameter quantiles
 
-#### Step 5: Posterior prediction (extrapolation)
+#### Step 5: Posterior extrapolation
 
 Draw samples from the posterior chain and run AZURE2 in extrapolation mode
 to produce uncertainty bands on the cross section / S-factor:
 
 ```bash
-python azure_mc.py predict input.azr mcmc_results.npz mc_setup.yaml
+python -m azure_mc mcmc extrapolate -i input.azr -c setup.yaml --chain mcmc_chain.npz
 # or with a specific number of draws:
-python azure_mc.py predict input.azr mcmc_results.npz mc_setup.yaml -n 200
+python -m azure_mc mcmc extrapolate -i input.azr -c setup.yaml --chain mcmc_chain.npz -n 200
 ```
 
 ## Configuration
 
-### mc_setup.yaml
+### setup.yaml
 
-**Shared settings** (used by both `run` and `mcmc`):
+**Shared settings** (used by `mc extrapolate`, `mcmc fit`, `mcmc extrapolate`):
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -175,17 +180,17 @@ python azure_mc.py predict input.azr mcmc_results.npz mc_setup.yaml -n 200
 | `seed` | `42` | Random seed for reproducibility |
 | `keep_tmp` | `false` | Keep temporary run directories |
 | `timeout` | `600` | Per-run timeout in seconds |
-| `params_file` | `mc_params.yaml` | Parameters file path |
+| `params_file` | `parameters.yaml` | Parameters file path |
 | `quantiles` | `[0.16, 0.50, 0.84]` | Quantile levels to compute |
 
-**Random MC settings** (used by `run`):
+**Random MC settings** (used by `mc extrapolate`):
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `n_samples` | `100` | Number of MC samples |
-| `output_file` | `mc_results.npz` | Output file path |
+| `output_file` | `mc_extrapolate.npz` | Output file path |
 
-**MCMC settings** (nested under `mcmc:`, used by `mcmc` and `predict`):
+**MCMC settings** (nested under `mcmc:`, used by `mcmc fit` and `mcmc extrapolate`):
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -194,11 +199,11 @@ python azure_mc.py predict input.azr mcmc_results.npz mc_setup.yaml -n 200
 | `n_burn` | `200` | Burn-in steps to discard |
 | `thin` | `1` | Thinning factor |
 | `init_spread` | `1e-4` | Walker initialisation spread |
-| `output_file` | `mcmc_results.npz` | Chain output file |
-| `predict_output_file` | `mcmc_predict.npz` | Prediction output file |
+| `output_file` | `mcmc_chain.npz` | Chain output file |
+| `extrapolate_output_file` | `mcmc_extrapolate.npz` | Extrapolation output file |
 | `progress` | `true` | Show progress bar |
 
-### mc_params.yaml
+### parameters.yaml
 
 Global defaults can be set under the `defaults` key:
 

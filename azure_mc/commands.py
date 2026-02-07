@@ -1,5 +1,6 @@
 """
-High-level sub-command implementations: populate, run, summary, quantiles.
+High-level sub-command implementations: populate, fit, extrapolate,
+summary, quantiles.
 """
 
 from __future__ import annotations
@@ -118,20 +119,20 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         "seed": 42,
         "keep_tmp": False,
         "timeout": 600,
-        "output_file": "mc_results.npz",
+        "output_file": "mc_extrapolate.npz",
         "params_file": params_out,
         "quantiles": [0.16, 0.50, 0.84],
         # "output_prefix": "mc_results",  # Optional: prefix for .dat files
 
-        # --- MCMC settings (used by the 'mcmc' command) ---
+        # --- MCMC settings (used by the 'fit' command) ---
         "mcmc": {
             "n_walkers": max(2 * total + 2, 32),
             "n_steps": 1000,
             "n_burn": 200,
             "thin": 1,
             "init_spread": 1e-4,
-            "output_file": "mcmc_results.npz",
-            "predict_output_file": "mcmc_predict.npz",
+            "output_file": "mcmc_chain.npz",
+            "extrapolate_output_file": "mcmc_extrapolate.npz",
             "progress": True,
         },
     }
@@ -142,12 +143,13 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         fh.write(f"# Generated from: {azr_filepath}\n")
         fh.write("#\n")
         fh.write("# MC (extrapolation) workflow:\n")
-        fh.write(f"#   python azure_mc.py run {azr_filepath} {setup_out}\n")
-        fh.write(f"#   python azure_mc.py quantiles mc_results.npz -c {setup_out}\n")
+        fh.write(f"#   python -m azure_mc mc extrapolate  -i {azr_filepath} -c {setup_out}\n")
+        fh.write(f"#   python -m azure_mc mc summary      -r mc_extrapolate.npz -q 0.16 0.50 0.84\n")
         fh.write("#\n")
-        fh.write("# MCMC (fit to data) workflow:\n")
-        fh.write(f"#   python azure_mc.py mcmc {azr_filepath} {setup_out}\n")
-        fh.write(f"#   python azure_mc.py predict {azr_filepath} mcmc_results.npz {setup_out}\n\n")
+        fh.write("# MCMC (fit + extrapolation) workflow:\n")
+        fh.write(f"#   python -m azure_mc mcmc fit          -i {azr_filepath} -c {setup_out}\n")
+        fh.write(f"#   python -m azure_mc mcmc extrapolate  -i {azr_filepath} -c {setup_out} --chain mcmc_chain.npz\n")
+        fh.write(f"#   python -m azure_mc mcmc summary      -r mcmc_extrapolate.npz\n\n")
         yaml.dump(setup_cfg, fh, default_flow_style=False, sort_keys=False)
 
     print(f"Setup  written to {setup_out}")
@@ -187,11 +189,11 @@ def cmd_run(
     seed = cfg.get("seed", 42)
     keep_tmp = cfg.get("keep_tmp", False)
     timeout = cfg.get("timeout", 600)
-    output_file = cfg.get("output_file", "mc_results.npz")
+    output_file = cfg.get("output_file", "mc_extrapolate.npz")
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
 
     # Load parameters from separate file
-    params_filepath = cfg.get("params_file", "mc_params.yaml")
+    params_filepath = cfg.get("params_file", "parameters.yaml")
     # Resolve relative to setup file directory
     if not os.path.isabs(params_filepath):
         params_filepath = os.path.join(
@@ -395,8 +397,6 @@ def cmd_run(
         save_dict[f"{safe_ch}/energies"] = energies
         save_dict[f"{safe_ch}/bucket_xs"] = bucket_xs_v
         save_dict[f"{safe_ch}/bucket_sf"] = bucket_sf_v
-        save_dict[f"{safe_ch}/quantiles_xs"] = q_xs
-        save_dict[f"{safe_ch}/quantiles_sf"] = q_sf
 
         # Write one output file per quantile level.
         # Each file has 3 columns: Energy(MeV)  CrossSection(b)  S-factor(MeV*b)
@@ -521,15 +521,17 @@ def cmd_summary(npz_file: str):
         safe_ch = str(ch_name).replace(".", "_").replace("=", "_")
         key_e = f"{safe_ch}/energies"
         key_bx = f"{safe_ch}/bucket_xs"
-        key_qx = f"{safe_ch}/quantiles_xs"
-        key_qs = f"{safe_ch}/quantiles_sf"
+        key_bs = f"{safe_ch}/bucket_sf"
         if key_e not in data:
             continue
 
         energies = data[key_e]
         bucket_xs = data[key_bx]
-        q_xs = data[key_qx]
-        q_sf = data[key_qs]
+        bucket_sf = data[key_bs]
+
+        # Compute quantiles on the fly
+        q_xs = np.nanquantile(bucket_xs, q_levels, axis=0)
+        q_sf = np.nanquantile(bucket_sf, q_levels, axis=0)
 
         print(f"--- Channel: {ch_name} ---")
         print(f"  Energy pts : {len(energies)}, "
@@ -600,7 +602,7 @@ def cmd_mcmc(
 ):
     """Run MCMC with *emcee* using AZURE2 χ² as the likelihood.
 
-    The parameters in ``mc_params.yaml`` are used as priors.
+    The parameters in ``parameters.yaml`` are used as priors.
     AZURE2 is invoked in *Calculate With Data* mode (choice 1) to
     evaluate the likelihood at each walker position proposed by emcee.
     """
@@ -633,11 +635,11 @@ def cmd_mcmc(
     n_burn = mcmc_cfg.get("n_burn", 200)
     thin = mcmc_cfg.get("thin", 1)
     init_spread = mcmc_cfg.get("init_spread", 1e-4)
-    output_file = mcmc_cfg.get("output_file", "mcmc_results.npz")
+    output_file = mcmc_cfg.get("output_file", "mcmc_chain.npz")
     progress = mcmc_cfg.get("progress", True)
 
     # ---- load parameter ranges ----
-    params_filepath = cfg.get("params_file", "mc_params.yaml")
+    params_filepath = cfg.get("params_file", "parameters.yaml")
     if not os.path.isabs(params_filepath):
         params_filepath = os.path.join(
             os.path.dirname(os.path.abspath(setup_filepath)), params_filepath
@@ -816,7 +818,7 @@ def cmd_mcmc(
     shutil.rmtree(base_tmp, ignore_errors=True)
 
 
-def cmd_mcmc_predict(
+def cmd_mcmc_extrapolate(
     azr_filepath: str,
     mcmc_npz_file: str,
     setup_filepath: str,
@@ -845,7 +847,7 @@ def cmd_mcmc_predict(
     keep_tmp = cfg.get("keep_tmp", False)
     timeout = cfg.get("timeout", 600)
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
-    output_file = mcmc_cfg.get("predict_output_file", "mcmc_predict.npz")
+    output_file = mcmc_cfg.get("extrapolate_output_file", "mcmc_extrapolate.npz")
 
     # ---- load MCMC chain ----
     mcmc_data = np.load(mcmc_npz_file, allow_pickle=True)
@@ -971,7 +973,7 @@ def cmd_mcmc_predict(
         "param_nominals": nominals,
         "quantile_levels": np.array(quantiles_list),
         "channel_names": np.array(channel_names),
-        "source": np.array("mcmc_predict"),
+        "source": np.array("mcmc_extrapolate"),
     }
 
     out_dir = Path(output_file).resolve().parent
@@ -1016,8 +1018,6 @@ def cmd_mcmc_predict(
         save_dict[f"{safe_ch}/energies"] = energies
         save_dict[f"{safe_ch}/bucket_xs"] = bucket_xs_v
         save_dict[f"{safe_ch}/bucket_sf"] = bucket_sf_v
-        save_dict[f"{safe_ch}/quantiles_xs"] = q_xs
-        save_dict[f"{safe_ch}/quantiles_sf"] = q_sf
 
         for qi, q in enumerate(quantiles_list):
             q_tag = f"Q{q * 100:g}"
@@ -1025,7 +1025,7 @@ def cmd_mcmc_predict(
             dat_path = out_dir / dat_name
             with open(dat_path, "w") as fh:
                 fh.write(f"# Channel  : {ch_name}\n")
-                fh.write(f"# Source   : MCMC posterior prediction\n")
+                fh.write(f"# Source   : MCMC posterior extrapolation\n")
                 fh.write(f"# Quantile : {q_tag}% ({n_valid} valid runs)\n")
                 fh.write(f"# Energy(MeV)  CrossSection(b)  S-factor(MeV*b)\n")
                 for j in range(n_pts):
