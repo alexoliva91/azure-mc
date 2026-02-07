@@ -19,6 +19,7 @@ the [BRICK](https://github.com/odell/brick) toolkit.
 
 - Python 3.9+
 - NumPy
+- SciPy (for distributions beyond uniform/gaussian)
 - PyYAML
 - emcee (for MCMC mode)
 - AZURE2 executable in PATH
@@ -211,7 +212,50 @@ Each parameter entry supports:
 | Key | Description |
 |-----|-------------|
 | `nominal` | Central value (from .azr file) |
-| `low` | Lower bound |
-| `high` | Upper bound |
-| `distribution` | `uniform` or `gaussian` |
-| `sigma` | Standard deviation (gaussian only; default: `(high-low)/4`) |
+| `low` | Lower bound (hard clipping / prior truncation) |
+| `high` | Upper bound (hard clipping / prior truncation) |
+| `distribution` | Distribution name (see below) |
+| `sigma` | Std deviation (for `gaussian` and `lognormal`) |
+| `mu` | Mean of ln(X) (for `lognormal`; default: `ln(|nominal|)`) |
+| `dist_params` | Dict of shape/loc/scale params (for scipy distributions) |
+
+#### Built-in distributions
+
+| Name | Parameters | Description |
+|------|-----------|-------------|
+| `uniform` | `low`, `high` | Flat between bounds (default) |
+| `gaussian` | `sigma` | Normal centered on `nominal`; default σ = (high−low)/4 |
+| `lognormal` | `mu`, `sigma` | Log-normal; defaults: mu = ln(|nominal|), σ = 1 |
+
+#### scipy.stats distributions
+
+Any [scipy.stats continuous distribution](https://docs.scipy.org/doc/scipy/reference/stats.html)
+can be used by setting `distribution` to the scipy name and providing
+shape/loc/scale parameters under `dist_params`.  `low`/`high` always
+act as hard bounds on top of the distribution.
+
+Examples:
+
+```yaml
+# Truncated normal (hard bounds from low/high)
+distribution: truncnorm
+dist_params:
+  a: -2       # lower clip in std devs
+  b: 2        # upper clip in std devs
+  loc: 1.0    # mean
+  scale: 0.5  # std dev
+
+# Gamma distribution
+distribution: gamma
+dist_params:
+  a: 2.0
+  scale: 50.0
+
+# Beta distribution
+distribution: beta
+dist_params:
+  a: 2.0
+  b: 5.0
+  loc: 10.0
+  scale: 5.0
+```

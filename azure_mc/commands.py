@@ -79,8 +79,24 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         fh.write(f"# {n_level_params} level params + {len(norms)} norm factors "
                  f"= {total} total\n")
         fh.write("#\n")
-        fh.write("# 'distribution' can be 'uniform' or 'gaussian'.\n")
-        fh.write("# For 'gaussian', add a 'sigma' key (std deviation).\n")
+        fh.write("# Built-in distributions:\n")
+        fh.write("#   uniform    — flat between low and high (default)\n")
+        fh.write("#   gaussian   — Normal(nominal, sigma); add 'sigma' key\n")
+        fh.write("#   lognormal  — LogNormal(mu, sigma); add 'mu' and 'sigma' keys\n")
+        fh.write("#                defaults: mu = ln(|nominal|), sigma = 1\n")
+        fh.write("#\n")
+        fh.write("# Any scipy.stats distribution is also supported.  Use the\n")
+        fh.write("# scipy name as 'distribution' and pass shape/loc/scale\n")
+        fh.write("# parameters under the 'dist_params' key.  Examples:\n")
+        fh.write("#\n")
+        fh.write("#   distribution: truncnorm\n")
+        fh.write("#   dist_params: {a: -2, b: 2, loc: 1.0, scale: 0.5}\n")
+        fh.write("#\n")
+        fh.write("#   distribution: gamma\n")
+        fh.write("#   dist_params: {a: 2.0, scale: 50.0}\n")
+        fh.write("#\n")
+        fh.write("# low/high always act as hard bounds (clipping for MC,\n")
+        fh.write("# truncation for MCMC prior).\n")
         fh.write("#\n")
         fh.write("# 'defaults' apply to any parameter missing low/high/distribution.\n\n")
         params_file_data = {
@@ -396,7 +412,7 @@ def cmd_run(
                     fh.write(f"{energies[j]:.6e}  {q_xs[qi, j]:.6e}  {q_sf[qi, j]:.6e}\n")
             log.info("    -> %s", dat_path)
 
-    np.savez(output_file, **save_dict)
+    np.savez(file=output_file, **save_dict)  # type: ignore[arg-type]
     log.info("Saved %s  (%d channels, %d runs)", output_file,
              len(channel_names), n_ok)
 
@@ -552,7 +568,12 @@ def _build_ranges(
     default_frac: float,
     default_dist: str,
 ) -> list[dict]:
-    """Build per-parameter range dicts, shared by ``cmd_run`` and ``cmd_mcmc``."""
+    """Build per-parameter range dicts, shared by ``cmd_run`` and ``cmd_mcmc``.
+
+    All user-specified keys (including ``dist_params``, ``mu``, ``sigma``,
+    etc.) are forwarded so that ``sample_theta`` and ``log_prior`` can
+    use them.
+    """
     ranges: list[dict] = []
     for i, key in enumerate(all_keys):
         nom = nominals[i]
@@ -563,10 +584,11 @@ def _build_ranges(
                 r.setdefault("low", nom - half)
                 r.setdefault("high", nom + half)
             r.setdefault("distribution", default_dist)
+            r.setdefault("nominal", nom)
         else:
             half = abs(nom) * default_frac if nom != 0 else 1.0
             r = {"low": nom - half, "high": nom + half,
-                 "distribution": default_dist}
+                 "distribution": default_dist, "nominal": nom}
         ranges.append(r)
     return ranges
 
@@ -745,7 +767,9 @@ def cmd_mcmc(
     log_prob = sampler.get_log_prob()              # (n_steps, n_walkers)
 
     actual_burn = min(n_burn, n_completed - 1)
-    flat_chain = sampler.get_chain(discard=actual_burn, thin=thin, flat=True)
+    flat_chain: np.ndarray = np.asarray(
+        sampler.get_chain(discard=actual_burn, thin=thin, flat=True)
+    )
     flat_log_prob = sampler.get_log_prob(discard=actual_burn, thin=thin,
                                         flat=True)
 
@@ -766,7 +790,7 @@ def cmd_mcmc(
         "posterior_quantiles": posterior_q,
     }
 
-    np.savez(output_file, **save_dict)
+    np.savez(file=output_file, **save_dict)
     log.info("Saved MCMC results → %s  (%d effective samples)",
              output_file, flat_chain.shape[0])
 
@@ -1009,7 +1033,7 @@ def cmd_mcmc_predict(
                              f"{q_sf[qi, j]:.6e}\n")
             log.info("    -> %s", dat_path)
 
-    np.savez(output_file, **save_dict)
+    np.savez(file=output_file, **save_dict)  # type: ignore[arg-type]
     log.info("Saved %s  (%d channels, %d runs)", output_file,
              len(channel_names), n_ok)
 

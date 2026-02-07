@@ -4,11 +4,57 @@ Parameter discovery, value extraction, and Monte Carlo sampling.
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 
 from .constants import DATA_NORM_FACTOR_INDEX, DATA_VARY_NORM_INDEX
 from .models import Level, Parameter, NormFactor
 from .io import read_levels, read_data_segments
+
+log = logging.getLogger(__name__)
+
+# ---- scipy lazy import ---------------------------------------------------
+
+_scipy_stats = None  # populated on first use
+
+
+def _get_scipy_stats():
+    """Import ``scipy.stats`` lazily so scipy is only required when needed."""
+    global _scipy_stats
+    if _scipy_stats is None:
+        try:
+            from scipy import stats as _st
+            _scipy_stats = _st
+        except ImportError:
+            raise ImportError(
+                "scipy is required for distributions other than "
+                "'uniform' and 'gaussian'.  Install with:  pip install scipy"
+            )
+    return _scipy_stats
+
+
+# Keys that belong to the range configuration, not to scipy dist_params.
+_RESERVED_KEYS = frozenset({
+    "distribution", "low", "high", "nominal", "sigma", "mu",
+    "description", "dist_params",
+})
+
+# Built-in distribution names handled without scipy.
+_BUILTIN_DISTRIBUTIONS = frozenset({
+    "uniform", "gaussian", "normal", "lognormal",
+})
+
+
+def _resolve_bounds(nom: float, r: dict) -> tuple[float, float]:
+    """Return (lo, hi) from a range dict, with sensible defaults."""
+    lo = r.get("low", nom * 0.8 if nom >= 0 else nom * 1.2)
+    hi = r.get("high", nom * 1.2 if nom >= 0 else nom * 0.8)
+    if lo > hi:
+        lo, hi = hi, lo
+    if lo == hi:
+        lo = nom - max(abs(nom) * 0.2, 1.0)
+        hi = nom + max(abs(nom) * 0.2, 1.0)
+    return lo, hi
 
 
 def discover_free_parameters(
@@ -98,23 +144,58 @@ def sample_theta(
     ranges: list[dict],
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Draw one MC sample for every free parameter."""
+    """Draw one MC sample for every free parameter.
+
+    Supported distributions
+    -----------------------
+    **uniform**
+        Flat between ``low`` and ``high``.
+    **gaussian** / **normal**
+        Normal centred on ``nominal`` with std ``sigma``.
+    **lognormal**
+        Log-normal parameterised by ``mu`` and ``sigma`` of ``ln(X)``.
+        Defaults: ``mu = ln(|nominal|)``, ``sigma = 1``.
+    *<any scipy.stats name>*
+        Looked up in ``scipy.stats``; shape / loc / scale parameters are
+        passed via the ``dist_params`` dict.
+
+    In every case ``low`` / ``high`` act as hard clipping bounds.
+    """
     theta = np.empty(len(nominals))
     for i, (nom, r) in enumerate(zip(nominals, ranges)):
         dist = r.get("distribution", "uniform")
-        lo = r.get("low", nom * 0.8 if nom >= 0 else nom * 1.2)
-        hi = r.get("high", nom * 1.2 if nom >= 0 else nom * 0.8)
-        if lo > hi:
-            lo, hi = hi, lo
-        if lo == hi:
-            lo = nom - max(abs(nom) * 0.2, 1.0)
-            hi = nom + max(abs(nom) * 0.2, 1.0)
+        lo, hi = _resolve_bounds(nom, r)
 
-        if dist == "gaussian":
+        if dist == "uniform":
+            theta[i] = rng.uniform(lo, hi)
+
+        elif dist in ("gaussian", "normal"):
             sigma = r.get("sigma", (hi - lo) / 4.0 if hi != lo else 1.0)
             theta[i] = rng.normal(nom, sigma)
+
+        elif dist == "lognormal":
+            mu = r.get("mu", np.log(abs(nom)) if nom != 0 else 0.0)
+            sigma = r.get("sigma", 1.0)
+            theta[i] = rng.lognormal(mu, sigma)
+
         else:
-            theta[i] = rng.uniform(lo, hi)
+            # Generic scipy.stats distribution
+            stats = _get_scipy_stats()
+            sp_cls = getattr(stats, dist, None)
+            if sp_cls is None:
+                raise ValueError(
+                    f"Unknown distribution '{dist}'. Must be 'uniform', "
+                    "'gaussian', 'lognormal', or a scipy.stats distribution "
+                    f"name (see scipy.stats docs).  Available: "
+                    f"https://docs.scipy.org/doc/scipy/reference/stats.html"
+                )
+            dist_params = dict(r.get("dist_params", {}))
+            # Use scipy's rvs with the numpy Generator
+            theta[i] = sp_cls.rvs(**dist_params, random_state=rng)
+
+        # Enforce hard bounds
+        theta[i] = np.clip(theta[i], lo, hi)
+
     return theta
 
 
@@ -126,11 +207,16 @@ def log_prior(
     theta: np.ndarray,
     ranges: list[dict],
 ) -> float:
-    """Compute the log-prior probability.
+    r"""Compute the log-prior probability.
 
-    * **uniform** prior → flat within ``[low, high]``, ``-inf`` outside.
-    * **gaussian** prior → :math:`\\mathcal{N}(\\text{nominal}, \\sigma)`
-      with hard bounds at ``[low, high]``.
+    * **uniform** → flat within ``[low, high]``, :math:`-\infty` outside.
+    * **gaussian** / **normal** →
+      :math:`\mathcal{N}(\text{nominal}, \sigma)` with hard bounds.
+    * **lognormal** →
+      :math:`\text{LogNormal}(\mu, \sigma)` with hard bounds.
+      Defaults: ``mu = \ln(|\text{nominal}|)``, ``sigma = 1``.
+    * *<scipy.stats name>* → ``logpdf`` from the frozen scipy
+      distribution, with hard bounds at ``[low, high]``.
     """
     lp = 0.0
     for val, r in zip(theta, ranges):
@@ -142,13 +228,42 @@ def log_prior(
         if val < lo or val > hi:
             return -np.inf
 
-        if dist == "gaussian":
+        if dist == "uniform":
+            pass  # flat prior → contributes 0
+
+        elif dist in ("gaussian", "normal"):
             nom = r.get("nominal", (lo + hi) / 2.0)
             sigma = r.get("sigma", (hi - lo) / 4.0 if hi != lo else 1.0)
             if sigma <= 0:
                 sigma = 1.0
             lp += -0.5 * ((val - nom) / sigma) ** 2
-        # uniform → constant log-prior (contributes 0)
+
+        elif dist == "lognormal":
+            if val <= 0:
+                return -np.inf
+            nom_val = r.get("nominal", 1.0)
+            mu = r.get("mu", np.log(abs(nom_val)) if nom_val != 0 else 0.0)
+            sigma = r.get("sigma", 1.0)
+            if sigma <= 0:
+                sigma = 1.0
+            lp += -(np.log(val) - mu) ** 2 / (2 * sigma ** 2) - np.log(val * sigma)
+
+        else:
+            # Generic scipy.stats distribution
+            stats = _get_scipy_stats()
+            sp_cls = getattr(stats, dist, None)
+            if sp_cls is None:
+                raise ValueError(
+                    f"Unknown distribution '{dist}' for log-prior.  "
+                    "Must be 'uniform', 'gaussian', 'lognormal', or a "
+                    "scipy.stats distribution name."
+                )
+            dist_params = dict(r.get("dist_params", {}))
+            logp = sp_cls.logpdf(val, **dist_params)
+            if not np.isfinite(logp):
+                return -np.inf
+            lp += logp
+
     return lp
 
 
