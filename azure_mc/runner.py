@@ -40,7 +40,7 @@ def generate_levels(
 
 def run_azure2(
     input_filename: str,
-    choice: int = 3,
+    choice: int,
     use_brune: bool = True,
     use_gsl: bool = True,
     ext_par_file: str = "\n",
@@ -51,8 +51,17 @@ def run_azure2(
     """
     Launch AZURE2 in --no-gui mode with the given menu choice.
 
-    choice=3 → "Extrapolate Without Data"
+    Menu choices:
+      1 → Calculate With Data
+      2 → Calculate Without Data
+      3 → Extrapolate Without Data
     """
+    valid_choices = {1, 2, 3}
+    if choice not in valid_choices:
+        raise ValueError(
+            f"Invalid AZURE2 menu choice {choice!r}; "
+            f"must be one of {sorted(valid_choices)}"
+        )
     cl_args = [command, input_filename, "--no-gui", "--no-readline"]
     if use_brune:
         cl_args += ["--use-brune"]
