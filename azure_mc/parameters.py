@@ -46,14 +46,25 @@ _BUILTIN_DISTRIBUTIONS = frozenset({
 
 
 def _resolve_bounds(nom: float, r: dict) -> tuple[float, float]:
-    """Return (lo, hi) from a range dict, with sensible defaults."""
-    lo = r.get("low", nom * 0.8 if nom >= 0 else nom * 1.2)
-    hi = r.get("high", nom * 1.2 if nom >= 0 else nom * 0.8)
-    if lo > hi:
-        lo, hi = hi, lo
-    if lo == hi:
-        lo = nom - max(abs(nom) * 0.2, 1.0)
-        hi = nom + max(abs(nom) * 0.2, 1.0)
+    """Return (lo, hi) from a range dict.
+
+    For **uniform** distributions ``low``/``high`` are required so
+    sensible ±20 % defaults are filled in.  For every other distribution
+    the default is ``(-inf, +inf)`` — i.e. no clipping unless the user
+    explicitly sets bounds.
+    """
+    dist = r.get("distribution", "uniform")
+    if dist == "uniform":
+        lo = r.get("low", nom * 0.8 if nom >= 0 else nom * 1.2)
+        hi = r.get("high", nom * 1.2 if nom >= 0 else nom * 0.8)
+        if lo > hi:
+            lo, hi = hi, lo
+        if lo == hi:
+            lo = nom - max(abs(nom) * 0.2, 1.0)
+            hi = nom + max(abs(nom) * 0.2, 1.0)
+    else:
+        lo = r.get("low", -np.inf)
+        hi = r.get("high", np.inf)
     return lo, hi
 
 
@@ -159,7 +170,8 @@ def sample_theta(
         Looked up in ``scipy.stats``; shape / loc / scale parameters are
         passed via the ``dist_params`` dict.
 
-    In every case ``low`` / ``high`` act as hard clipping bounds.
+    If ``low`` / ``high`` are set they act as hard clipping bounds;
+    otherwise no clipping is applied.
     """
     theta = np.empty(len(nominals))
     for i, (nom, r) in enumerate(zip(nominals, ranges)):
@@ -170,7 +182,10 @@ def sample_theta(
             theta[i] = rng.uniform(lo, hi)
 
         elif dist in ("gaussian", "normal"):
-            sigma = r.get("sigma", (hi - lo) / 4.0 if hi != lo else 1.0)
+            sigma = r.get("sigma",
+                          (hi - lo) / 4.0
+                          if np.isfinite(hi) and np.isfinite(lo) and hi != lo
+                          else 1.0)
             theta[i] = rng.normal(nom, sigma)
 
         elif dist == "lognormal":
@@ -193,8 +208,9 @@ def sample_theta(
             # Use scipy's rvs with the numpy Generator
             theta[i] = sp_cls.rvs(**dist_params, random_state=rng)
 
-        # Enforce hard bounds
-        theta[i] = np.clip(theta[i], lo, hi)
+        # Enforce hard bounds (only if explicitly set)
+        if np.isfinite(lo) or np.isfinite(hi):
+            theta[i] = np.clip(theta[i], lo, hi)
 
     return theta
 
@@ -286,15 +302,21 @@ def initialize_walkers(
     p0 = np.empty((n_walkers, ndim))
 
     for i, (nom, r) in enumerate(zip(nominals, ranges)):
-        lo = r.get("low", nom - 1.0)
-        hi = r.get("high", nom + 1.0)
-        width = (hi - lo) * spread
+        lo = r.get("low", -np.inf)
+        hi = r.get("high", np.inf)
+        if np.isfinite(lo) and np.isfinite(hi):
+            width = (hi - lo) * spread
+        else:
+            width = max(abs(nom) * spread, 1e-10)
         if width == 0:
             width = max(abs(nom) * spread, 1e-10)
 
         for w in range(n_walkers):
             val = nom + width * rng.standard_normal()
-            val = max(lo, min(hi, val))        # clamp within bounds
+            if np.isfinite(lo):
+                val = max(lo, val)
+            if np.isfinite(hi):
+                val = min(hi, val)
             p0[w, i] = val
 
     return p0

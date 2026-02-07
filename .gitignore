@@ -1,3 +1,4 @@
 *.azr
+*.yaml
 __pycache__/
 .venv/

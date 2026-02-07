@@ -27,21 +27,17 @@ from .runner import run_single, log_probability
 log = logging.getLogger(__name__)
 
 
-def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
-    """
-    Dry-run: parse .azr, discover free parameters, write two YAML files.
-
-    * *setup_out*  — run settings (n_samples, quantiles, defaults, …)
-    * *params_out* — per-parameter ranges / distributions
-    """
-    contents = read_input_file(azr_filepath)
-    params, norms, addresses = discover_free_parameters(contents)
-    values = get_input_values(contents, params, norms, addresses)
-
+def _write_params_file(
+    azr_filepath: str,
+    params_out: str,
+    params,
+    norms,
+    values: list[float],
+):
+    """Write the shared parameters YAML file (used by both MC and MCMC)."""
     n_level_params = len(params)
     total = n_level_params + len(norms)
 
-    # ---- parameters file ----
     param_entries = {}
     for i, p in enumerate(params):
         nom = values[i]
@@ -75,10 +71,13 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         }
 
     with open(params_out, "w") as fh:
-        fh.write("# AZURE2 MC — free-parameter ranges\n")
+        fh.write("# AZURE2 — free-parameter ranges / priors\n")
         fh.write(f"# Generated from: {azr_filepath}\n")
         fh.write(f"# {n_level_params} level params + {len(norms)} norm factors "
                  f"= {total} total\n")
+        fh.write("#\n")
+        fh.write("# For MC:   low/high act as hard sampling bounds (clipping).\n")
+        fh.write("# For MCMC: low/high act as hard prior bounds (-inf outside).\n")
         fh.write("#\n")
         fh.write("# Built-in distributions:\n")
         fh.write("#   uniform    — flat between low and high (default)\n")
@@ -96,9 +95,6 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         fh.write("#   distribution: gamma\n")
         fh.write("#   dist_params: {a: 2.0, scale: 50.0}\n")
         fh.write("#\n")
-        fh.write("# low/high always act as hard bounds (clipping for MC,\n")
-        fh.write("# truncation for MCMC prior).\n")
-        fh.write("#\n")
         fh.write("# 'defaults' apply to any parameter missing low/high/distribution.\n\n")
         params_file_data = {
             "defaults": {
@@ -109,7 +105,39 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         }
         yaml.dump(params_file_data, fh, default_flow_style=False, sort_keys=False)
 
-    # ---- setup file ----
+
+def _print_discovered_params(params, norms, values):
+    """Print the discovered free parameters to stdout."""
+    n_level_params = len(params)
+    total = n_level_params + len(norms)
+    print(f"  {n_level_params} level parameters + {len(norms)} norm factors "
+          f"= {total} free parameters")
+    print()
+    print("Free parameters discovered:")
+    for i, p in enumerate(params):
+        print(f"  [{i:3d}] {p.key():50s}  nominal = {values[i]:15.6g}  "
+              f"| {p.description()}")
+    for j, nf in enumerate(norms):
+        idx = n_level_params + j
+        print(f"  [{idx:3d}] {nf.key():50s}  nominal = {values[idx]:15.6g}  "
+              f"| {nf.description()}")
+
+
+def cmd_mc_populate(azr_filepath: str, setup_out: str, params_out: str):
+    """
+    Populate MC config files from an .azr input.
+
+    * *setup_out*  — MC run settings (n_samples, quantiles, …)
+    * *params_out* — per-parameter ranges / distributions (shared format)
+    """
+    contents = read_input_file(azr_filepath)
+    params, norms, addresses = discover_free_parameters(contents)
+    values = get_input_values(contents, params, norms, addresses)
+
+    # ---- shared parameters file ----
+    _write_params_file(azr_filepath, params_out, params, norms, values)
+
+    # ---- setup file (MC-only) ----
     setup_cfg = {
         "azure2_exe": "AZURE2",
         "use_brune": True,
@@ -123,48 +151,78 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         "params_file": params_out,
         "quantiles": [0.16, 0.50, 0.84],
         # "output_prefix": "mc_results",  # Optional: prefix for .dat files
-
-        # --- MCMC settings (used by the 'fit' command) ---
-        "mcmc": {
-            "n_walkers": max(2 * total + 2, 32),
-            "n_steps": 1000,
-            "n_burn": 200,
-            "thin": 1,
-            "init_spread": 1e-4,
-            "output_file": "mcmc_chain.npz",
-            "extrapolate_output_file": "mcmc_extrapolate.npz",
-            "progress": True,
-        },
     }
 
     with open(setup_out, "w") as fh:
-        fh.write("# AZURE2 Monte Carlo — run setup\n")
-        fh.write("# --------------------------------\n")
+        fh.write("# AZURE2 Monte Carlo — MC run setup\n")
+        fh.write("# -----------------------------------\n")
         fh.write(f"# Generated from: {azr_filepath}\n")
         fh.write("#\n")
-        fh.write("# MC (extrapolation) workflow:\n")
-        fh.write(f"#   python -m azure_mc mc extrapolate  -i {azr_filepath} -c {setup_out}\n")
-        fh.write(f"#   python -m azure_mc mc summary      -r mc_extrapolate.npz -q 0.16 0.50 0.84\n")
-        fh.write("#\n")
-        fh.write("# MCMC (fit + extrapolation) workflow:\n")
-        fh.write(f"#   python -m azure_mc mcmc fit          -i {azr_filepath} -c {setup_out}\n")
-        fh.write(f"#   python -m azure_mc mcmc extrapolate  -i {azr_filepath} -c {setup_out} --chain mcmc_chain.npz\n")
-        fh.write(f"#   python -m azure_mc mcmc summary      -r mcmc_extrapolate.npz\n\n")
+        fh.write("# Workflow:\n")
+        fh.write(f"#   1. python -m azure_mc mc populate     -i {azr_filepath}\n")
+        fh.write(f"#   2. (edit {params_out} — adjust sampling ranges)\n")
+        fh.write(f"#   3. python -m azure_mc mc extrapolate  -i {azr_filepath} -c {setup_out}\n")
+        fh.write(f"#   4. python -m azure_mc mc summary      -r mc_extrapolate.npz -q 0.16 0.50 0.84\n\n")
         yaml.dump(setup_cfg, fh, default_flow_style=False, sort_keys=False)
 
-    print(f"Setup  written to {setup_out}")
-    print(f"Params written to {params_out}")
-    print(f"  {n_level_params} level parameters + {len(norms)} norm factors "
-          f"= {total} free parameters")
-    print()
-    print("Free parameters discovered:")
-    for i, p in enumerate(params):
-        print(f"  [{i:3d}] {p.key():50s}  nominal = {values[i]:15.6g}  "
-              f"| {p.description()}")
-    for j, nf in enumerate(norms):
-        idx = n_level_params + j
-        print(f"  [{idx:3d}] {nf.key():50s}  nominal = {values[idx]:15.6g}  "
-              f"| {nf.description()}")
+    print(f"MC setup  written to {setup_out}")
+    print(f"Params    written to {params_out}")
+    _print_discovered_params(params, norms, values)
+
+
+def cmd_mcmc_populate(azr_filepath: str, setup_out: str, params_out: str):
+    """
+    Populate MCMC config files from an .azr input.
+
+    * *setup_out*  — MCMC settings (n_walkers, n_steps, …)
+    * *params_out* — per-parameter ranges / priors (shared format)
+    """
+    contents = read_input_file(azr_filepath)
+    params, norms, addresses = discover_free_parameters(contents)
+    values = get_input_values(contents, params, norms, addresses)
+
+    n_level_params = len(params)
+    total = n_level_params + len(norms)
+
+    # ---- shared parameters file ----
+    _write_params_file(azr_filepath, params_out, params, norms, values)
+
+    # ---- setup file (MCMC-only, flat structure) ----
+    setup_cfg = {
+        "azure2_exe": "AZURE2",
+        "use_brune": True,
+        "use_gsl": True,
+        "max_workers": os.cpu_count(),
+        "seed": 42,
+        "timeout": 600,
+        "params_file": params_out,
+        "quantiles": [0.16, 0.50, 0.84],
+        "n_walkers": max(2 * total + 2, 32),
+        "n_steps": 1000,
+        "n_burn": 200,
+        "thin": 1,
+        "init_spread": 1e-4,
+        "output_file": "mcmc_chain.npz",
+        "extrapolate_output_file": "mcmc_extrapolate.npz",
+        "progress": True,
+    }
+
+    with open(setup_out, "w") as fh:
+        fh.write("# AZURE2 MCMC — run setup\n")
+        fh.write("# ------------------------\n")
+        fh.write(f"# Generated from: {azr_filepath}\n")
+        fh.write("#\n")
+        fh.write("# Workflow:\n")
+        fh.write(f"#   1. python -m azure_mc mcmc populate     -i {azr_filepath}\n")
+        fh.write(f"#   2. (edit {params_out} — adjust priors)\n")
+        fh.write(f"#   3. python -m azure_mc mcmc fit          -i {azr_filepath} -c {setup_out}\n")
+        fh.write(f"#   4. python -m azure_mc mcmc extrapolate  -i {azr_filepath} -c {setup_out} --chain mcmc_chain.npz\n")
+        fh.write(f"#   5. python -m azure_mc mcmc summary      -r mcmc_extrapolate.npz\n\n")
+        yaml.dump(setup_cfg, fh, default_flow_style=False, sort_keys=False)
+
+    print(f"MCMC setup written to {setup_out}")
+    print(f"Params     written to {params_out}")
+    _print_discovered_params(params, norms, values)
 
 
 def cmd_run(
@@ -581,7 +639,10 @@ def _build_ranges(
         nom = nominals[i]
         if key in user_params:
             r = dict(user_params[key])
-            if "low" not in r or "high" not in r:
+            dist = r.get("distribution", default_dist)
+            # Only inject default low/high for uniform (it needs them);
+            # other distributions work without bounds.
+            if dist == "uniform" and ("low" not in r or "high" not in r):
                 half = abs(nom) * default_frac if nom != 0 else 1.0
                 r.setdefault("low", nom - half)
                 r.setdefault("high", nom + half)
@@ -613,11 +674,9 @@ def cmd_mcmc(
         sys.exit(1)
     from multiprocessing import Pool
 
-    # ---- load config ----
+    # ---- load config (flat structure — no nested 'mcmc' block) ----
     with open(setup_filepath, "r") as fh:
         cfg = yaml.safe_load(fh) or {}
-
-    mcmc_cfg = cfg.get("mcmc", {})
 
     azure2_cmd = cfg.get("azure2_exe", "AZURE2")
     if not shutil.which(azure2_cmd):
@@ -630,13 +689,13 @@ def cmd_mcmc(
     timeout = cfg.get("timeout", 600)
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
 
-    n_walkers = mcmc_cfg.get("n_walkers", 32)
-    n_steps = mcmc_cfg.get("n_steps", 1000)
-    n_burn = mcmc_cfg.get("n_burn", 200)
-    thin = mcmc_cfg.get("thin", 1)
-    init_spread = mcmc_cfg.get("init_spread", 1e-4)
-    output_file = mcmc_cfg.get("output_file", "mcmc_chain.npz")
-    progress = mcmc_cfg.get("progress", True)
+    n_walkers = cfg.get("n_walkers", 32)
+    n_steps = cfg.get("n_steps", 1000)
+    n_burn = cfg.get("n_burn", 200)
+    thin = cfg.get("thin", 1)
+    init_spread = cfg.get("init_spread", 1e-4)
+    output_file = cfg.get("output_file", "mcmc_chain.npz")
+    progress = cfg.get("progress", True)
 
     # ---- load parameter ranges ----
     params_filepath = cfg.get("params_file", "parameters.yaml")
@@ -830,11 +889,9 @@ def cmd_mcmc_extrapolate(
     This produces the same kind of quantile ``.dat`` files as ``cmd_run``
     but using parameter vectors drawn from the posterior distribution.
     """
-    # ---- load config ----
+    # ---- load config (flat structure) ----
     with open(setup_filepath, "r") as fh:
         cfg = yaml.safe_load(fh) or {}
-
-    mcmc_cfg = cfg.get("mcmc", {})
 
     azure2_cmd = cfg.get("azure2_exe", "AZURE2")
     if not shutil.which(azure2_cmd):
@@ -847,7 +904,7 @@ def cmd_mcmc_extrapolate(
     keep_tmp = cfg.get("keep_tmp", False)
     timeout = cfg.get("timeout", 600)
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
-    output_file = mcmc_cfg.get("extrapolate_output_file", "mcmc_extrapolate.npz")
+    output_file = cfg.get("extrapolate_output_file", "mcmc_extrapolate.npz")
 
     # ---- load MCMC chain ----
     mcmc_data = np.load(mcmc_npz_file, allow_pickle=True)
