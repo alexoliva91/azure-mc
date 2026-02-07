@@ -2,6 +2,9 @@
 
 Monte Carlo error estimation for AZURE2 R-matrix calculations.
 
+The classes and functions in this package are inspired by those of
+the [BRICK](https://github.com/odell/brick) toolkit. 
+
 ## Requirements
 
 - Python 3.9+
