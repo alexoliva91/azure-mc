@@ -1,0 +1,21 @@
+# AZURE2 Monte Carlo — run setup
+# --------------------------------
+# Generated from: 0-nogamma+sub.azr
+#
+# To run:
+#   python azure_mc.py run 0-nogamma+sub.azr mc_setup.yaml
+
+azure2_exe: AZURE2
+use_brune: true
+use_gsl: true
+n_samples: 100
+max_workers: 4
+seed: 42
+keep_tmp: false
+timeout: 600
+output_file: mc_results.npz
+params_file: mc_params.yaml
+quantiles:
+- 0.16
+- 0.5
+- 0.84
