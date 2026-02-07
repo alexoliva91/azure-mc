@@ -116,3 +116,70 @@ def sample_theta(
         else:
             theta[i] = rng.uniform(lo, hi)
     return theta
+
+
+# -------------------------------------------------------------------
+# MCMC helpers
+# -------------------------------------------------------------------
+
+def log_prior(
+    theta: np.ndarray,
+    ranges: list[dict],
+) -> float:
+    """Compute the log-prior probability.
+
+    * **uniform** prior → flat within ``[low, high]``, ``-inf`` outside.
+    * **gaussian** prior → :math:`\\mathcal{N}(\\text{nominal}, \\sigma)`
+      with hard bounds at ``[low, high]``.
+    """
+    lp = 0.0
+    for val, r in zip(theta, ranges):
+        dist = r.get("distribution", "uniform")
+        lo = r.get("low", -np.inf)
+        hi = r.get("high", np.inf)
+
+        # Hard bounds always enforced
+        if val < lo or val > hi:
+            return -np.inf
+
+        if dist == "gaussian":
+            nom = r.get("nominal", (lo + hi) / 2.0)
+            sigma = r.get("sigma", (hi - lo) / 4.0 if hi != lo else 1.0)
+            if sigma <= 0:
+                sigma = 1.0
+            lp += -0.5 * ((val - nom) / sigma) ** 2
+        # uniform → constant log-prior (contributes 0)
+    return lp
+
+
+def initialize_walkers(
+    nominals: np.ndarray,
+    ranges: list[dict],
+    n_walkers: int,
+    rng: np.random.Generator,
+    spread: float = 1e-4,
+) -> np.ndarray:
+    """Create initial walker positions as a tight ball around *nominals*.
+
+    Parameters
+    ----------
+    spread : float
+        Fraction of the parameter range used as standard deviation for the
+        initial perturbation.
+    """
+    ndim = len(nominals)
+    p0 = np.empty((n_walkers, ndim))
+
+    for i, (nom, r) in enumerate(zip(nominals, ranges)):
+        lo = r.get("low", nom - 1.0)
+        hi = r.get("high", nom + 1.0)
+        width = (hi - lo) * spread
+        if width == 0:
+            width = max(abs(nom) * spread, 1e-10)
+
+        for w in range(n_walkers):
+            val = nom + width * rng.standard_normal()
+            val = max(lo, min(hi, val))        # clamp within bounds
+            p0[w, i] = val
+
+    return p0

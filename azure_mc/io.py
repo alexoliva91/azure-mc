@@ -16,7 +16,11 @@ from .constants import (
     ENERGY_INDEX,
     WIDTH_INDEX,
     CHANNEL_RADIUS_INDEX,
+    DATA_INCLUDE_INDEX,
+    DATA_IN_CHANNEL_INDEX,
+    DATA_OUT_CHANNEL_INDEX,
     DATA_NORM_FACTOR_INDEX,
+    DATA_FILEPATH_INDEX,
     OUTPUT_DIR_INDEX,
 )
 from .models import Level
@@ -229,3 +233,75 @@ def parse_extrap(filepath: str) -> np.ndarray:
                 except ValueError:
                     continue
     return np.array(data) if data else np.empty((0, 3))
+
+
+# -------------------------------------------------------------------
+# Parse AZURE2 chiSquared.out
+# -------------------------------------------------------------------
+
+def parse_chi_squared(filepath: str) -> Optional[float]:
+    """Read total chi-squared from AZURE2's ``chiSquared.out``.
+
+    The file lists χ²/N per segment; the **last** non-empty line
+    contains the total χ² of the calculation.
+    """
+    if not os.path.isfile(filepath):
+        return None
+    last_value: Optional[float] = None
+    with open(filepath, "r") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                parts = stripped.split()
+                last_value = float(parts[-1])
+            except (ValueError, IndexError):
+                continue
+    return last_value
+
+
+def get_data_output_files(contents: list[str]) -> list[str]:
+    """Derive ``.out`` output filenames from ``<segmentsData>``."""
+    data_segs = read_data_segments(contents)
+    files: set[str] = set()
+    for seg in data_segs:
+        include = int(seg[DATA_INCLUDE_INDEX])
+        if include:
+            in_ch = seg[DATA_IN_CHANNEL_INDEX]
+            out_ch = seg[DATA_OUT_CHANNEL_INDEX]
+            if int(out_ch) == -1:
+                fname = f"AZUREOut_aa={in_ch}_TOTAL_CAPTURE.out"
+            else:
+                fname = f"AZUREOut_aa={in_ch}_R={out_ch}.out"
+            files.add(fname)
+    return sorted(files)
+
+
+def resolve_data_paths(contents: list[str], azr_base_dir: str) -> list[str]:
+    """Resolve relative data-file paths in ``<segmentsData>`` to absolute.
+
+    This is needed when writing ``.azr`` files to temporary directories
+    (e.g. for MCMC evaluations) so that data files are still found.
+    """
+    contents = list(contents)               # shallow copy
+    try:
+        start = contents.index("<segmentsData>") + 1
+        stop = contents.index("</segmentsData>")
+    except ValueError:
+        return contents
+
+    for i in range(start, stop):
+        line = contents[i]
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) > DATA_FILEPATH_INDEX:
+            filepath = parts[DATA_FILEPATH_INDEX]
+            if not os.path.isabs(filepath):
+                abs_path = os.path.normpath(
+                    os.path.join(azr_base_dir, filepath)
+                )
+                # Replace the filepath token (always the last token)
+                contents[i] = line[: line.rfind(filepath)] + abs_path
+    return contents

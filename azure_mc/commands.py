@@ -15,9 +15,12 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from .io import read_input_file, read_levels, get_extrap_output_files
-from .parameters import discover_free_parameters, get_input_values, sample_theta
-from .runner import run_single
+from .io import read_input_file, read_levels, get_extrap_output_files, resolve_data_paths
+from .parameters import (
+    discover_free_parameters, get_input_values, sample_theta,
+    log_prior, initialize_walkers,
+)
+from .runner import run_single, log_probability
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +101,18 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         "params_file": params_out,
         "quantiles": [0.16, 0.50, 0.84],
         # "output_prefix": "mc_results",  # Optional: prefix for .dat files
+
+        # --- MCMC settings (used by the 'mcmc' command) ---
+        "mcmc": {
+            "n_walkers": max(2 * total + 2, 32),
+            "n_steps": 1000,
+            "n_burn": 200,
+            "thin": 1,
+            "init_spread": 1e-4,
+            "output_file": "mcmc_results.npz",
+            "predict_output_file": "mcmc_predict.npz",
+            "progress": True,
+        },
     }
 
     with open(setup_out, "w") as fh:
@@ -105,11 +120,13 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         fh.write("# --------------------------------\n")
         fh.write(f"# Generated from: {azr_filepath}\n")
         fh.write("#\n")
-        fh.write("# To run:\n")
+        fh.write("# MC (extrapolation) workflow:\n")
         fh.write(f"#   python azure_mc.py run {azr_filepath} {setup_out}\n")
+        fh.write(f"#   python azure_mc.py quantiles mc_results.npz -c {setup_out}\n")
         fh.write("#\n")
-        fh.write("# 'quantiles' are used for both the MC run and can be reused with:\n")
-        fh.write(f"#   python azure_mc.py quantiles mc_results.npz -c {setup_out}\n\n")
+        fh.write("# MCMC (fit to data) workflow:\n")
+        fh.write(f"#   python azure_mc.py mcmc {azr_filepath} {setup_out}\n")
+        fh.write(f"#   python azure_mc.py predict {azr_filepath} mcmc_results.npz {setup_out}\n\n")
         yaml.dump(setup_cfg, fh, default_flow_style=False, sort_keys=False)
 
     print(f"Setup  written to {setup_out}")
@@ -531,5 +548,468 @@ def cmd_summary(npz_file: str):
                 prev_i = i
             if n_pts > 6:
                 print(f"    ({n_pts - 6} more rows)")
-            print()
-        print()
+
+
+# ======================================================================
+# MCMC commands
+# ======================================================================
+
+def _build_ranges(
+    all_keys: list[str],
+    nominals: np.ndarray,
+    user_params: dict,
+    default_frac: float,
+    default_dist: str,
+) -> list[dict]:
+    """Build per-parameter range dicts, shared by ``cmd_run`` and ``cmd_mcmc``."""
+    ranges: list[dict] = []
+    for i, key in enumerate(all_keys):
+        nom = nominals[i]
+        if key in user_params:
+            r = dict(user_params[key])
+            if "low" not in r or "high" not in r:
+                half = abs(nom) * default_frac if nom != 0 else 1.0
+                r.setdefault("low", nom - half)
+                r.setdefault("high", nom + half)
+            r.setdefault("distribution", default_dist)
+        else:
+            half = abs(nom) * default_frac if nom != 0 else 1.0
+            r = {"low": nom - half, "high": nom + half,
+                 "distribution": default_dist}
+        ranges.append(r)
+    return ranges
+
+
+def cmd_mcmc(
+    azr_filepath: str,
+    setup_filepath: str,
+    tmp_dir: str | None = None,
+):
+    """Run MCMC with *emcee* using AZURE2 χ² as the likelihood.
+
+    The parameters in ``mc_params.yaml`` are used as priors.
+    AZURE2 is invoked in *Calculate With Data* mode (choice 1) to
+    evaluate the likelihood at each walker position proposed by emcee.
+    """
+    try:
+        import emcee
+    except ImportError:
+        log.error("emcee is required for MCMC.  Install with:  pip install emcee")
+        sys.exit(1)
+    from multiprocessing import Pool
+
+    # ---- load config ----
+    with open(setup_filepath, "r") as fh:
+        cfg = yaml.safe_load(fh) or {}
+
+    mcmc_cfg = cfg.get("mcmc", {})
+
+    azure2_cmd = cfg.get("azure2_exe", "AZURE2")
+    if not shutil.which(azure2_cmd):
+        log.error("AZURE2 executable '%s' not found in PATH.", azure2_cmd)
+        sys.exit(1)
+    use_brune = cfg.get("use_brune", True)
+    use_gsl = cfg.get("use_gsl", True)
+    max_workers = cfg.get("max_workers", 4)
+    seed = cfg.get("seed", 42)
+    timeout = cfg.get("timeout", 600)
+    quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
+
+    n_walkers = mcmc_cfg.get("n_walkers", 32)
+    n_steps = mcmc_cfg.get("n_steps", 1000)
+    n_burn = mcmc_cfg.get("n_burn", 200)
+    thin = mcmc_cfg.get("thin", 1)
+    init_spread = mcmc_cfg.get("init_spread", 1e-4)
+    output_file = mcmc_cfg.get("output_file", "mcmc_results.npz")
+    progress = mcmc_cfg.get("progress", True)
+
+    # ---- load parameter ranges ----
+    params_filepath = cfg.get("params_file", "mc_params.yaml")
+    if not os.path.isabs(params_filepath):
+        params_filepath = os.path.join(
+            os.path.dirname(os.path.abspath(setup_filepath)), params_filepath
+        )
+    with open(params_filepath, "r") as fh:
+        params_data = yaml.safe_load(fh) or {}
+    user_params = params_data.get("parameters", params_data)
+    defaults = params_data.get("defaults", {})
+    default_frac = defaults.get("fraction", 0.2)
+    default_dist = defaults.get("distribution", "uniform")
+
+    # ---- parse .azr & resolve data paths ----
+    contents = read_input_file(azr_filepath)
+    azr_base_dir = os.path.dirname(os.path.abspath(azr_filepath))
+    contents = resolve_data_paths(contents, azr_base_dir)
+
+    params, norms, addresses = discover_free_parameters(contents)
+    nominals_list = get_input_values(contents, params, norms, addresses)
+    nominals = np.array(nominals_list)
+    levels = read_levels(contents)
+    n_level = len(params)
+    ndim = len(nominals)
+
+    all_keys = [p.key() for p in params] + [nf.key() for nf in norms]
+    ranges = _build_ranges(all_keys, nominals, user_params,
+                           default_frac, default_dist)
+
+    # ---- sanity checks ----
+    if n_walkers < 2 * ndim:
+        old_nw = n_walkers
+        n_walkers = 2 * ndim + 2
+        log.warning("n_walkers (%d) < 2*ndim (%d).  Increased to %d.",
+                    old_nw, 2 * ndim, n_walkers)
+
+    log.info("MCMC setup  : %d walkers, %d steps, %d params (n_burn=%d, thin=%d)",
+             n_walkers, n_steps, ndim, n_burn, thin)
+    log.info("  Level params: %d,  Norm factors: %d", n_level, len(norms))
+
+    # ---- initialise walkers ----
+    rng = np.random.default_rng(seed)
+    p0 = initialize_walkers(nominals, ranges, n_walkers, rng,
+                            spread=init_spread)
+
+    # ---- temp workspace ----
+    if tmp_dir is None:
+        import tempfile
+        base_tmp = tempfile.mkdtemp(prefix="azure_mcmc_")
+    else:
+        base_tmp = tmp_dir
+        os.makedirs(base_tmp, exist_ok=True)
+    log.info("Temporary workspace: %s", base_tmp)
+
+    # ---- run sampler ----
+    lp_args = (
+        contents, levels, addresses, ranges,
+        n_level, norms,
+        azure2_cmd, use_brune, use_gsl, base_tmp, timeout,
+    )
+
+    # Graceful shutdown handling
+    shutdown_requested = False
+
+    def _handle_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        shutdown_requested = True
+        log.warning("Shutdown requested (signal %d) — "
+                    "finishing current step...", signum)
+
+    old_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
+    old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
+
+    try:
+        if max_workers > 1:
+            pool = Pool(max_workers)
+            sampler = emcee.EnsembleSampler(
+                n_walkers, ndim, log_probability,
+                args=lp_args, pool=pool,
+            )
+        else:
+            pool = None
+            sampler = emcee.EnsembleSampler(
+                n_walkers, ndim, log_probability,
+                args=lp_args,
+            )
+
+        log.info("Starting MCMC ...")
+        for step_result in sampler.sample(p0, iterations=n_steps,
+                                          progress=progress):
+            if shutdown_requested:
+                log.warning("Stopping MCMC early at step %d.", sampler.iteration)
+                break
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+        if pool is not None:
+            pool.terminate()
+            pool.join()
+
+    n_completed = sampler.iteration
+    log.info("MCMC completed %d/%d steps.  Mean acceptance: %.3f",
+             n_completed, n_steps,
+             np.mean(sampler.acceptance_fraction))
+
+    # ---- autocorrelation ----
+    try:
+        tau = sampler.get_autocorr_time(quiet=True)
+        log.info("Autocorrelation times (mean %.1f): %s",
+                 np.mean(tau), np.round(tau, 1))
+    except emcee.autocorr.AutocorrError:
+        tau = np.full(ndim, np.nan)
+        log.warning("Could not estimate autocorrelation (chain too short)")
+
+    # ---- save ----
+    chain = sampler.get_chain()                    # (n_steps, n_walkers, ndim)
+    log_prob = sampler.get_log_prob()              # (n_steps, n_walkers)
+
+    actual_burn = min(n_burn, n_completed - 1)
+    flat_chain = sampler.get_chain(discard=actual_burn, thin=thin, flat=True)
+    flat_log_prob = sampler.get_log_prob(discard=actual_burn, thin=thin,
+                                        flat=True)
+
+    posterior_q = np.quantile(flat_chain, quantiles_list, axis=0)  # (n_q, ndim)
+
+    save_dict = {
+        "chain": chain,
+        "log_prob": log_prob,
+        "flat_chain": flat_chain,
+        "flat_log_prob": flat_log_prob,
+        "param_keys": np.array(all_keys),
+        "param_nominals": nominals,
+        "acceptance_fraction": sampler.acceptance_fraction,
+        "autocorr_time": tau,
+        "n_burn": np.array(actual_burn),
+        "thin": np.array(thin),
+        "quantile_levels": np.array(quantiles_list),
+        "posterior_quantiles": posterior_q,
+    }
+
+    np.savez(output_file, **save_dict)
+    log.info("Saved MCMC results → %s  (%d effective samples)",
+             output_file, flat_chain.shape[0])
+
+    # ---- posterior summary ----
+    print(f"\nMCMC Posterior Summary "
+          f"(steps={n_completed}, burn-in={actual_burn}, thin={thin}, "
+          f"effective={flat_chain.shape[0]}):")
+    print(f"  Mean acceptance fraction: "
+          f"{np.mean(sampler.acceptance_fraction):.3f}")
+    print()
+    header = f"{'Parameter':<50s}"
+    for q in quantiles_list:
+        header += f"  {'Q'+str(q*100)+'%':>12s}"
+    print(header)
+    print("-" * (50 + 14 * len(quantiles_list)))
+    for i, key in enumerate(all_keys):
+        row = f"{key:<50s}"
+        for qi in range(len(quantiles_list)):
+            row += f"  {posterior_q[qi, i]:>12.6g}"
+        print(row)
+
+    # ---- cleanup ----
+    shutil.rmtree(base_tmp, ignore_errors=True)
+
+
+def cmd_mcmc_predict(
+    azr_filepath: str,
+    mcmc_npz_file: str,
+    setup_filepath: str,
+    n_draws: int | None = None,
+    tmp_dir: str | None = None,
+):
+    """Draw posterior samples from an MCMC chain and run AZURE2 extrapolation.
+
+    This produces the same kind of quantile ``.dat`` files as ``cmd_run``
+    but using parameter vectors drawn from the posterior distribution.
+    """
+    # ---- load config ----
+    with open(setup_filepath, "r") as fh:
+        cfg = yaml.safe_load(fh) or {}
+
+    mcmc_cfg = cfg.get("mcmc", {})
+
+    azure2_cmd = cfg.get("azure2_exe", "AZURE2")
+    if not shutil.which(azure2_cmd):
+        log.error("AZURE2 executable '%s' not found in PATH.", azure2_cmd)
+        sys.exit(1)
+    use_brune = cfg.get("use_brune", True)
+    use_gsl = cfg.get("use_gsl", True)
+    max_workers = cfg.get("max_workers", 4)
+    seed = cfg.get("seed", 42)
+    keep_tmp = cfg.get("keep_tmp", False)
+    timeout = cfg.get("timeout", 600)
+    quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
+    output_file = mcmc_cfg.get("predict_output_file", "mcmc_predict.npz")
+
+    # ---- load MCMC chain ----
+    mcmc_data = np.load(mcmc_npz_file, allow_pickle=True)
+    flat_chain = mcmc_data["flat_chain"]
+    all_keys_saved = list(mcmc_data["param_keys"])
+    n_available = flat_chain.shape[0]
+
+    if n_draws is None:
+        n_draws = min(100, n_available)
+    n_draws = min(n_draws, n_available)
+
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(n_available, size=n_draws, replace=False)
+    all_theta = flat_chain[indices]
+
+    log.info("Drawing %d posterior samples from %s (%d available)",
+             n_draws, mcmc_npz_file, n_available)
+
+    # ---- parse .azr ----
+    contents = read_input_file(azr_filepath)
+    params, norms, addresses = discover_free_parameters(contents)
+    nominals_list = get_input_values(contents, params, norms, addresses)
+    nominals = np.array(nominals_list)
+    levels = read_levels(contents)
+    extrap_files = get_extrap_output_files(contents)
+    n_level = len(params)
+
+    all_keys = [p.key() for p in params] + [nf.key() for nf in norms]
+    if all_keys != all_keys_saved:
+        log.warning("Parameter keys in .azr differ from MCMC chain.  "
+                    "Ensure the same .azr file was used.")
+
+    if not extrap_files:
+        log.error("No <segmentsTest> found in %s — "
+                  "nothing to extrapolate.", azr_filepath)
+        sys.exit(1)
+
+    # ---- temp workspace ----
+    if tmp_dir is None:
+        import tempfile
+        base_tmp = tempfile.mkdtemp(prefix="azure_mcmc_pred_")
+    else:
+        base_tmp = tmp_dir
+        os.makedirs(base_tmp, exist_ok=True)
+    log.info("Temporary workspace: %s", base_tmp)
+
+    # ---- run extrapolations ----
+    log.info("Launching %d extrapolation runs (%d workers) ...",
+             n_draws, max_workers)
+
+    results_dict: dict[int, dict[str, np.ndarray]] = {}
+    n_failed = 0
+
+    shutdown_requested = False
+
+    def _handle_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        shutdown_requested = True
+        log.warning("Shutdown requested")
+
+    old_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
+    old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
+
+    try:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for i in range(n_draws):
+                theta_levels = all_theta[i, :n_level]
+                norm_updates = None
+                if norms:
+                    norm_updates = [
+                        (nf.index, float(all_theta[i, n_level + j]))
+                        for j, nf in enumerate(norms)
+                    ]
+                fut = executor.submit(
+                    run_single, i,
+                    contents, levels, addresses, theta_levels,
+                    extrap_files, azure2_cmd, use_brune, use_gsl,
+                    base_tmp, keep_tmp, timeout,
+                    norm_updates=norm_updates,
+                )
+                futures[fut] = i
+
+            for fut in as_completed(futures):
+                run_id, data, msg = fut.result()
+                if data is not None:
+                    results_dict[run_id] = data
+                else:
+                    n_failed += 1
+                    log.warning("  %s", msg)
+                done = len(results_dict) + n_failed
+                if done % max(1, n_draws // 20) == 0:
+                    log.info("  Progress: %d/%d  (%d ok, %d failed)",
+                             done, n_draws, len(results_dict), n_failed)
+                if shutdown_requested:
+                    for pending in futures:
+                        pending.cancel()
+                    break
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+
+    log.info("Done: %d/%d succeeded, %d failed",
+             len(results_dict), n_draws, n_failed)
+
+    if not results_dict:
+        log.error("No successful runs.")
+        if not keep_tmp:
+            shutil.rmtree(base_tmp, ignore_errors=True)
+        return
+
+    # ---- assemble results (same logic as cmd_run) ----
+    sorted_ids = sorted(results_dict.keys())
+    n_ok = len(sorted_ids)
+
+    channel_names = sorted(
+        {ch for per_file in results_dict.values() for ch in per_file}
+    )
+    log.info("Channels found: %s", channel_names)
+
+    save_dict: dict[str, np.ndarray] = {
+        "samples": all_theta[sorted_ids] if max(sorted_ids) < len(all_theta) else all_theta[:n_ok],
+        "param_keys": np.array(all_keys),
+        "param_nominals": nominals,
+        "quantile_levels": np.array(quantiles_list),
+        "channel_names": np.array(channel_names),
+        "source": np.array("mcmc_predict"),
+    }
+
+    out_dir = Path(output_file).resolve().parent
+    out_stem = Path(output_file).stem
+
+    for ch_name in channel_names:
+        ref_run = None
+        for rid in sorted_ids:
+            if ch_name in results_dict[rid]:
+                ref_run = results_dict[rid][ch_name]
+                break
+        if ref_run is None:
+            continue
+
+        energies = ref_run[:, 0]
+        n_pts = len(energies)
+
+        bucket_xs = np.full((n_ok, n_pts), np.nan)
+        bucket_sf = np.full((n_ok, n_pts), np.nan)
+        for idx, rid in enumerate(sorted_ids):
+            if ch_name not in results_dict[rid]:
+                continue
+            arr = results_dict[rid][ch_name]
+            if arr.shape[0] == n_pts:
+                bucket_xs[idx] = arr[:, 1]
+                bucket_sf[idx] = arr[:, 2]
+
+        valid_mask = ~np.all(np.isnan(bucket_xs), axis=1)
+        bucket_xs_v = bucket_xs[valid_mask]
+        bucket_sf_v = bucket_sf[valid_mask]
+        n_valid = bucket_xs_v.shape[0]
+        log.info("  Channel %-45s  %d pts x %d valid",
+                 ch_name, n_pts, n_valid)
+
+        if n_valid == 0:
+            continue
+
+        q_xs = np.nanquantile(bucket_xs_v, quantiles_list, axis=0)
+        q_sf = np.nanquantile(bucket_sf_v, quantiles_list, axis=0)
+
+        safe_ch = ch_name.replace(".", "_").replace("=", "_")
+        save_dict[f"{safe_ch}/energies"] = energies
+        save_dict[f"{safe_ch}/bucket_xs"] = bucket_xs_v
+        save_dict[f"{safe_ch}/bucket_sf"] = bucket_sf_v
+        save_dict[f"{safe_ch}/quantiles_xs"] = q_xs
+        save_dict[f"{safe_ch}/quantiles_sf"] = q_sf
+
+        for qi, q in enumerate(quantiles_list):
+            q_tag = f"Q{q * 100:g}"
+            dat_name = f"{out_stem}_{safe_ch}_{q_tag}.dat"
+            dat_path = out_dir / dat_name
+            with open(dat_path, "w") as fh:
+                fh.write(f"# Channel  : {ch_name}\n")
+                fh.write(f"# Source   : MCMC posterior prediction\n")
+                fh.write(f"# Quantile : {q_tag}% ({n_valid} valid runs)\n")
+                fh.write(f"# Energy(MeV)  CrossSection(b)  S-factor(MeV*b)\n")
+                for j in range(n_pts):
+                    fh.write(f"{energies[j]:.6e}  {q_xs[qi, j]:.6e}  "
+                             f"{q_sf[qi, j]:.6e}\n")
+            log.info("    -> %s", dat_path)
+
+    np.savez(output_file, **save_dict)
+    log.info("Saved %s  (%d channels, %d runs)", output_file,
+             len(channel_names), n_ok)
+
+    if not keep_tmp:
+        shutil.rmtree(base_tmp, ignore_errors=True)
