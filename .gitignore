@@ -1,2 +1,3 @@
 *.azr
 __pycache__/
+.venv/

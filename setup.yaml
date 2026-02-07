@@ -1,0 +1,36 @@
+# AZURE2 Monte Carlo — run setup
+# --------------------------------
+# Generated from: 0-nogamma+sub_THM.azr
+#
+# MC (extrapolation) workflow:
+#   python -m azure_mc mc extrapolate  -i 0-nogamma+sub_THM.azr -c setup.yaml
+#   python -m azure_mc mc summary      -r mc_extrapolate.npz -q 0.16 0.50 0.84
+#
+# MCMC (fit + extrapolation) workflow:
+#   python -m azure_mc mcmc fit          -i 0-nogamma+sub_THM.azr -c setup.yaml
+#   python -m azure_mc mcmc extrapolate  -i 0-nogamma+sub_THM.azr -c setup.yaml --chain mcmc_chain.npz
+#   python -m azure_mc mcmc summary      -r mcmc_extrapolate.npz
+
+azure2_exe: AZURE2
+use_brune: true
+use_gsl: true
+n_samples: 100
+max_workers: 12
+seed: 42
+keep_tmp: false
+timeout: 600
+output_file: mc_extrapolate.npz
+params_file: parameters.yaml
+quantiles:
+- 0.16
+- 0.5
+- 0.84
+mcmc:
+  n_walkers: 34
+  n_steps: 1000
+  n_burn: 200
+  thin: 1
+  init_spread: 0.0001
+  output_file: mcmc_chain.npz
+  extrapolate_output_file: mcmc_extrapolate.npz
+  progress: true
