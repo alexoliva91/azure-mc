@@ -13,7 +13,7 @@ from .commands import (
     cmd_mcmc, cmd_mcmc_extrapolate,
 )
 
-_PROG = "python -m azure_mc"
+_PROG = "azure-mc"
 
 
 def main():

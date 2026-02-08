@@ -30,8 +30,30 @@ the [BRICK](https://github.com/odell/brick) toolkit.
 
 ## Installation
 
+### For Development
+
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/alexoliva/azure-mc.git
+cd azure-mc
+pip install -e .
+```
+
+### From PyPI (when published)
+
+```bash
+pip install azure-mc
+```
+
+### Using pipx (recommended for CLI tools)
+
+```bash
+pipx install azure-mc
+```
+
+Or for local development:
+
+```bash
+pipx install -e .
 ```
 
 ## Project Structure
@@ -52,11 +74,15 @@ azure_mc/                # Package
 
 ## Usage
 
+After installation with pip or pipx:
+
 ```bash
-python -m azure_mc <command> <subcommand> [options]
+azure-mc <command> <subcommand> [options]
 ```
 
-For backwards compatibility, `python azure_mc.py ...` also works.
+Alternatively, you can still use:
+- `python -m azure_mc <command> <subcommand> [options]`
+- `python azure_mc.py ...` (backwards compatibility)
 
 Commands:
 
@@ -75,7 +101,7 @@ Commands:
 #### Step 1: Discover parameters
 
 ```bash
-python -m azure_mc mc populate -i input.azr
+azure-mc mc populate -i input.azr
 ```
 
 This creates two files:
@@ -90,13 +116,13 @@ sigma values for each free parameter.
 #### Step 3: Extrapolate
 
 ```bash
-python -m azure_mc mc extrapolate -i input.azr -c mc_setup.yaml
+azure-mc mc extrapolate -i input.azr -c mc_setup.yaml
 ```
 
 #### Step 4: Inspect results
 
 ```bash
-python -m azure_mc mc summary -r mc_extrapolate.npz
+azure-mc mc summary -r mc_extrapolate.npz
 ```
 
 #### Step 5 (optional): Recompute quantiles
@@ -104,10 +130,10 @@ python -m azure_mc mc summary -r mc_extrapolate.npz
 Pass `-q` to `summary` to also write `.dat` files:
 
 ```bash
-python -m azure_mc mc summary -r mc_extrapolate.npz -q 0.025 0.5 0.975
+azure-mc mc summary -r mc_extrapolate.npz -q 0.025 0.5 0.975
 
 # With a custom output file prefix:
-python -m azure_mc mc summary -r mc_extrapolate.npz -q 0.16 0.84 -p my_prefix
+azure-mc mc summary -r mc_extrapolate.npz -q 0.16 0.84 -p my_prefix
 ```
 
 ### Workflow B — MCMC (fit to experimental data)
@@ -122,7 +148,7 @@ centered on `nominal` with width `sigma`, hard-bounded by `low`/`high`).
 #### Step 1: Discover parameters
 
 ```bash
-python -m azure_mc mcmc populate -i input.azr
+azure-mc mcmc populate -i input.azr
 ```
 
 This creates two files:
@@ -153,7 +179,7 @@ In `mcmc_setup.yaml`, edit:
 #### Step 4: Fit
 
 ```bash
-python -m azure_mc mcmc fit -i input.azr -c mcmc_setup.yaml
+azure-mc mcmc fit -i input.azr -c mcmc_setup.yaml
 ```
 
 The output `mcmc_chain.npz` contains:
@@ -169,9 +195,9 @@ Draw samples from the posterior chain and run AZURE2 in extrapolation mode
 to produce uncertainty bands on the cross section / S-factor:
 
 ```bash
-python -m azure_mc mcmc extrapolate -i input.azr -c mcmc_setup.yaml --chain mcmc_chain.npz
+azure-mc mcmc extrapolate -i input.azr -c mcmc_setup.yaml --chain mcmc_chain.npz
 # or with a specific number of draws:
-python -m azure_mc mcmc extrapolate -i input.azr -c mcmc_setup.yaml --chain mcmc_chain.npz -n 200
+azure-mc mcmc extrapolate -i input.azr -c mcmc_setup.yaml --chain mcmc_chain.npz -n 200
 ```
 
 ## Configuration
