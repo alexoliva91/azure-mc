@@ -46,7 +46,7 @@ def run_azure2(
     ext_par_file: str = "\n",
     ext_capture_file: str = "\n",
     command: str = "AZURE2",
-    timeout: int = 600,
+    timeout: int = 0,
     azure_threads: int = 1,
 ) -> tuple[str, str, int]:
     """
@@ -58,6 +58,7 @@ def run_azure2(
       3 → Extrapolate Without Data
     
     Args:
+        timeout: Timeout in seconds. 0 means no timeout (wait indefinitely).
         azure_threads: Number of OpenMP threads for AZURE2 (sets OMP_NUM_THREADS)
     """
     valid_choices = {1, 2, 3}
@@ -77,8 +78,10 @@ def run_azure2(
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(azure_threads)
     p = Popen(cl_args, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
+    # Convert timeout=0 to None (no timeout)
+    timeout_val = None if timeout == 0 else timeout
     try:
-        stdout, stderr = p.communicate(options.encode("utf-8"), timeout=timeout)
+        stdout, stderr = p.communicate(options.encode("utf-8"), timeout=timeout_val)
         return stdout.decode("utf-8"), stderr.decode("utf-8"), p.returncode
     except subprocess.TimeoutExpired:
         p.kill()

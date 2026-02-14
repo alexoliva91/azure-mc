@@ -176,7 +176,7 @@ def cmd_mc_populate(azr_filepath: str, setup_out: str, params_out: str):
         "azure_threads": "auto",
         "seed": 42,
         "keep_tmp": False,
-        "timeout": 600,
+        "timeout": 0,
         "output_file": "mc_extrapolate.npz",
         "params_file": params_out,
         "quantiles": [0.16, 0.50, 0.84],
@@ -225,7 +225,7 @@ def cmd_mcmc_populate(azr_filepath: str, setup_out: str, params_out: str):
         "max_workers": "auto",
         "azure_threads": "auto",
         "seed": 42,
-        "timeout": 600,
+        "timeout": 0,
         "params_file": params_out,
         "quantiles": [0.16, 0.50, 0.84],
         "n_walkers": max(2 * total + 2, 32),
@@ -285,7 +285,7 @@ def cmd_run(
     use_gsl = cfg.get("use_gsl", True)
     seed = cfg.get("seed", 42)
     keep_tmp = cfg.get("keep_tmp", False)
-    timeout = cfg.get("timeout", 600)
+    timeout = cfg.get("timeout", 0)
     output_file = cfg.get("output_file", "mc_extrapolate.npz")
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
 
@@ -736,7 +736,7 @@ def cmd_mcmc(
     )
     
     seed = cfg.get("seed", 42)
-    timeout = cfg.get("timeout", 600)
+    timeout = cfg.get("timeout", 0)
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
 
     n_walkers = cfg.get("n_walkers", 32)
