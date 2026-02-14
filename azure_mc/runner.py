@@ -47,6 +47,7 @@ def run_azure2(
     ext_capture_file: str = "\n",
     command: str = "AZURE2",
     timeout: int = 600,
+    azure_threads: int = 1,
 ) -> tuple[str, str, int]:
     """
     Launch AZURE2 in --no-gui mode with the given menu choice.
@@ -55,6 +56,9 @@ def run_azure2(
       1 → Calculate With Data
       2 → Calculate Without Data
       3 → Extrapolate Without Data
+    
+    Args:
+        azure_threads: Number of OpenMP threads for AZURE2 (sets OMP_NUM_THREADS)
     """
     valid_choices = {1, 2, 3}
     if choice not in valid_choices:
@@ -69,10 +73,9 @@ def run_azure2(
         cl_args += ["--gsl-coul"]
 
     options = f"{choice}\n{ext_par_file}{ext_capture_file}"
-    # Force single-threaded execution so multiprocessing can
-    # parallelise across walkers / samples instead.
+    # Set OpenMP threads for AZURE2's linear algebra operations
     env = os.environ.copy()
-    env["OMP_NUM_THREADS"] = "1"
+    env["OMP_NUM_THREADS"] = str(azure_threads)
     p = Popen(cl_args, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
     try:
         stdout, stderr = p.communicate(options.encode("utf-8"), timeout=timeout)
@@ -97,6 +100,7 @@ def run_single(
     keep_tmp: bool,
     timeout: int,
     norm_updates: Optional[list[tuple[int, float]]] = None,
+    azure_threads: int = 1,
 ) -> tuple[int, Optional[dict[str, np.ndarray]], str]:
     """Execute one AZURE2 extrapolation run.
 
@@ -125,6 +129,7 @@ def run_single(
         use_gsl=use_gsl,
         command=azure2_cmd,
         timeout=timeout,
+        azure_threads=azure_threads,
     )
 
     if rc != 0:
@@ -207,6 +212,7 @@ def run_single_fit(
     base_tmp_dir: str,
     timeout: int,
     norm_updates: Optional[list[tuple[int, float]]] = None,
+    azure_threads: int = 1,
 ) -> tuple[str | int, Optional[float], str]:
     """Run AZURE2 in *Calculate With Data* mode and return log-likelihood.
 
@@ -238,6 +244,7 @@ def run_single_fit(
         use_gsl=use_gsl,
         command=azure2_cmd,
         timeout=timeout,
+        azure_threads=azure_threads,
     )
 
     if rc != 0:
@@ -278,6 +285,7 @@ def log_probability(
     use_gsl: bool,
     base_tmp_dir: str,
     timeout: int,
+    azure_threads: int = 1,
 ) -> float:
     """Log-posterior for *emcee*: ``log_prior + log_likelihood``.
 
@@ -304,6 +312,7 @@ def log_probability(
         data_output_files,
         azure2_cmd, use_brune, use_gsl, base_tmp_dir, timeout,
         norm_updates=norm_updates,
+        azure_threads=azure_threads,
     )
 
     if lnl is None:

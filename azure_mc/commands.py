@@ -27,6 +27,35 @@ from .runner import run_single, log_probability
 log = logging.getLogger(__name__)
 
 
+def _resolve_auto_parallelism(max_workers, azure_threads, cpu_count):
+    """
+    Resolve 'auto' values for max_workers and azure_threads.
+    
+    Strategy:
+    - azure_threads = 4 (good balance for linear algebra operations)
+    - max_workers = cpu_count // azure_threads
+    - Ensures total_threads = max_workers * azure_threads ≤ cpu_count
+    
+    Returns:
+        tuple: (resolved_max_workers, resolved_azure_threads)
+    """
+    # Handle 'auto' for azure_threads
+    if azure_threads == 'auto':
+        # Optimal: 4 threads for BLAS/LAPACK, but adjust for small CPUs
+        if cpu_count >= 8:
+            azure_threads = 4
+        elif cpu_count >= 4:
+            azure_threads = 2
+        else:
+            azure_threads = 1
+    
+    # Handle 'auto' for max_workers
+    if max_workers == 'auto':
+        max_workers = max(1, cpu_count // azure_threads)
+    
+    return max_workers, azure_threads
+
+
 def _write_params_file(
     azr_filepath: str,
     params_out: str,
@@ -143,7 +172,8 @@ def cmd_mc_populate(azr_filepath: str, setup_out: str, params_out: str):
         "use_brune": True,
         "use_gsl": True,
         "n_samples": 100,
-        "max_workers": os.cpu_count(),
+        "max_workers": "auto",
+        "azure_threads": "auto",
         "seed": 42,
         "keep_tmp": False,
         "timeout": 600,
@@ -192,7 +222,8 @@ def cmd_mcmc_populate(azr_filepath: str, setup_out: str, params_out: str):
         "azure2_exe": "AZURE2",
         "use_brune": True,
         "use_gsl": True,
-        "max_workers": os.cpu_count(),
+        "max_workers": "auto",
+        "azure_threads": "auto",
         "seed": 42,
         "timeout": 600,
         "params_file": params_out,
@@ -236,6 +267,14 @@ def cmd_run(
 
     n_samples = cfg.get("n_samples", 100)
     max_workers = cfg.get("max_workers", os.cpu_count())
+    azure_threads = cfg.get("azure_threads", 1)
+    
+    # Resolve 'auto' values
+    cpu_count = os.cpu_count() or 1
+    max_workers, azure_threads = _resolve_auto_parallelism(
+        max_workers, azure_threads, cpu_count
+    )
+    
     azure2_cmd = cfg.get("azure2_exe", "AZURE2")
     if not shutil.which(azure2_cmd):
         log.error("AZURE2 executable '%s' not found in PATH. "
@@ -277,6 +316,8 @@ def cmd_run(
     log.info("  %d level params + %d norm factors = %d free",
              n_level, len(norms), len(nominals))
     log.info("  Extrap output files: %s", extrap_files)
+    log.info("Parallelism: %d workers × %d Azure threads = %d total threads",
+             max_workers, azure_threads, max_workers * azure_threads)
 
     # Build per-parameter range dicts
     all_keys = [p.key() for p in params] + [nf.key() for nf in norms]
@@ -351,6 +392,7 @@ def cmd_run(
                     keep_tmp,
                     timeout,
                     norm_updates=norm_updates,
+                    azure_threads=azure_threads,
                 )
                 futures[fut] = i
 
@@ -685,6 +727,14 @@ def cmd_mcmc(
     use_brune = cfg.get("use_brune", True)
     use_gsl = cfg.get("use_gsl", True)
     max_workers = cfg.get("max_workers", os.cpu_count())
+    azure_threads = cfg.get("azure_threads", 1)
+    
+    # Resolve 'auto' values
+    cpu_count = os.cpu_count() or 1
+    max_workers, azure_threads = _resolve_auto_parallelism(
+        max_workers, azure_threads, cpu_count
+    )
+    
     seed = cfg.get("seed", 42)
     timeout = cfg.get("timeout", 600)
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
@@ -742,6 +792,8 @@ def cmd_mcmc(
              n_walkers, n_steps, ndim, n_burn, thin)
     log.info("  Level params: %d,  Norm factors: %d", n_level, len(norms))
     log.info("  Data output files: %s", data_output_files)
+    log.info("Parallelism: %d workers × %d Azure threads = %d total threads",
+             max_workers, azure_threads, max_workers * azure_threads)
 
     # ---- initialise walkers ----
     rng = np.random.default_rng(seed)
@@ -762,6 +814,7 @@ def cmd_mcmc(
         contents, levels, addresses, ranges,
         n_level, norms, data_output_files,
         azure2_cmd, use_brune, use_gsl, base_tmp, timeout,
+        azure_threads,
     )
 
     # Graceful shutdown handling
