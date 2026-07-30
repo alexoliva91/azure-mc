@@ -9,67 +9,128 @@ import os
 import shutil
 import signal
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 import yaml
 
+from . import pyazr_adapter
 from .io import read_input_file, read_levels, get_extrap_output_files
 from .parameters import discover_free_parameters, get_input_values, sample_theta
 from .runner import run_single
 
 log = logging.getLogger(__name__)
 
+DEFAULT_ENGINE = "pyazr"
 
-def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
-    """
-    Dry-run: parse .azr, discover free parameters, write two YAML files.
 
-    * *setup_out*  — run settings (n_samples, quantiles, defaults, …)
-    * *params_out* — per-parameter ranges / distributions
-    """
+def _default_range(nominal: float, is_norm: bool) -> tuple[float, float]:
+    """Default +/- range for a free parameter with no explicit YAML entry."""
+    if is_norm:
+        return float(nominal * 0.8), float(nominal * 1.2)
+    if nominal != 0:
+        half = abs(nominal) * 0.2
+        return float(nominal - half), float(nominal + half)
+    return -1.0, 1.0
+
+
+def _populate_legacy(azr_filepath: str):
+    """Discover free parameters by parsing the .azr file directly."""
     contents = read_input_file(azr_filepath)
     params, norms, addresses = discover_free_parameters(contents)
     values = get_input_values(contents, params, norms, addresses)
-
     n_level_params = len(params)
-    total = n_level_params + len(norms)
 
-    # ---- parameters file ----
-    param_entries = {}
+    entries = {}
+    summary_lines = []
     for i, p in enumerate(params):
         nom = values[i]
-        frac = 0.2
-        if nom != 0:
-            half = abs(nom) * frac
-            lo, hi = nom - half, nom + half
-        else:
-            lo, hi = -1.0, 1.0
-        param_entries[p.key()] = {
-            "description": p.description(),
-            "nominal": float(nom),
-            "low": float(lo),
-            "high": float(hi),
-            "distribution": "uniform",
+        lo, hi = _default_range(nom, is_norm=False)
+        entries[p.key()] = {
+            "description": p.description(), "nominal": float(nom),
+            "low": lo, "high": hi, "distribution": "uniform",
         }
-
+        summary_lines.append(
+            f"  [{i:3d}] {p.key():50s}  nominal = {nom:15.6g}  | {p.description()}")
     for j, nf in enumerate(norms):
         idx = n_level_params + j
         nom = values[idx]
-        param_entries[nf.key()] = {
-            "description": nf.description(),
-            "nominal": float(nom),
-            "low": float(nom * 0.8),
-            "high": float(nom * 1.2),
-            "distribution": "uniform",
+        lo, hi = _default_range(nom, is_norm=True)
+        entries[nf.key()] = {
+            "description": nf.description(), "nominal": float(nom),
+            "low": lo, "high": hi, "distribution": "uniform",
         }
+        summary_lines.append(
+            f"  [{idx:3d}] {nf.key():50s}  nominal = {nom:15.6g}  | {nf.description()}")
 
+    header = (f"{n_level_params} level parameters + {len(norms)} norm factors "
+              f"= {len(entries)} free parameters (engine=legacy)")
+    return entries, header, summary_lines
+
+
+def _populate_pyazr(azr_filepath: str, azure2_binary: str | None,
+                     pyazr_path: str | None):
+    """Discover free parameters via a live pyazr session."""
+    azr = pyazr_adapter.open_session(
+        azr_filepath, nprocs=1, binary=azure2_binary, pyazr_path=pyazr_path)
+    try:
+        free_params = pyazr_adapter.list_free_parameters(azr)
+    finally:
+        azr.close()
+
+    entries = {}
+    summary_lines = []
+    for i, fp in enumerate(free_params):
+        lo, hi = _default_range(fp.nominal, is_norm=(fp.kind == "norm"))
+        entries[fp.key] = {
+            "description": fp.description, "nominal": fp.nominal,
+            "low": lo, "high": hi, "distribution": "uniform",
+        }
+        summary_lines.append(
+            f"  [{i:3d}] {fp.key:50s}  nominal = {fp.nominal:15.6g}  | {fp.description}")
+
+    header = f"{len(entries)} free parameters (engine=pyazr)"
+    return entries, header, summary_lines
+
+
+def cmd_populate(
+    azr_filepath: str,
+    setup_out: str,
+    params_out: str,
+    engine: str = DEFAULT_ENGINE,
+    azure2_binary: str | None = None,
+    pyazr_path: str | None = None,
+):
+    """
+    Dry-run: discover free parameters, write two YAML files.
+
+    * *setup_out*  — run settings (n_samples, quantiles, defaults, …)
+    * *params_out* — per-parameter ranges / distributions
+
+    Discovery uses the ``pyazr`` engine (a live AZURE2 API session) by
+    default; if ``pyazr`` is not importable this falls back to legacy .azr
+    text parsing with a warning. Pass ``engine="legacy"`` to force the
+    fallback.
+    """
+    if engine == "pyazr":
+        try:
+            param_entries, header, summary_lines = _populate_pyazr(
+                azr_filepath, azure2_binary, pyazr_path)
+        except pyazr_adapter.PyazrUnavailableError as exc:
+            log.warning("pyazr unavailable (%s); falling back to engine=legacy.", exc)
+            engine = "legacy"
+    if engine == "legacy":
+        param_entries, header, summary_lines = _populate_legacy(azr_filepath)
+    elif engine != "pyazr":
+        log.error("Unknown engine '%s' (expected 'legacy' or 'pyazr')", engine)
+        sys.exit(1)
+
+    # ---- parameters file ----
     with open(params_out, "w") as fh:
         fh.write("# AZURE2 MC — free-parameter ranges\n")
-        fh.write(f"# Generated from: {azr_filepath}\n")
-        fh.write(f"# {n_level_params} level params + {len(norms)} norm factors "
-                 f"= {total} total\n")
+        fh.write(f"# Generated from: {azr_filepath}  (engine={engine})\n")
+        fh.write(f"# {header}\n")
         fh.write("#\n")
         fh.write("# 'distribution' can be 'uniform' or 'gaussian'.\n")
         fh.write("# For 'gaussian', add a 'sigma' key (std deviation).\n")
@@ -86,14 +147,20 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
 
     # ---- setup file ----
     setup_cfg = {
+        "engine": engine,
+        # -- pyazr engine settings --
+        "azure2_binary": azure2_binary or "",
+        "pyazr_path": pyazr_path or "",
+        # -- legacy engine settings --
         "azure2_exe": "AZURE2",
         "use_brune": True,
         "use_gsl": True,
+        # -- shared settings --
         "n_samples": 100,
         "max_workers": 4,
         "seed": 42,
         "keep_tmp": False,
-        "timeout": 600,
+        "timeout": 1800 if engine == "pyazr" else 600,
         "output_file": "mc_results.npz",
         "params_file": params_out,
         "quantiles": [0.16, 0.50, 0.84],
@@ -105,6 +172,12 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
         fh.write("# --------------------------------\n")
         fh.write(f"# Generated from: {azr_filepath}\n")
         fh.write("#\n")
+        fh.write("# 'engine' selects the execution backend:\n")
+        fh.write("#   pyazr  - persistent AZURE2 API session (fast; needs\n")
+        fh.write("#            'azure2_binary'/'pyazr_path' set, or pyazr\n")
+        fh.write("#            already importable on PYTHONPATH).\n")
+        fh.write("#   legacy - spawns one AZURE2 --no-gui subprocess per sample.\n")
+        fh.write("#\n")
         fh.write("# To run:\n")
         fh.write(f"#   python azure_mc.py run {azr_filepath} {setup_out}\n")
         fh.write("#\n")
@@ -114,85 +187,25 @@ def cmd_populate(azr_filepath: str, setup_out: str, params_out: str):
 
     print(f"Setup  written to {setup_out}")
     print(f"Params written to {params_out}")
-    print(f"  {n_level_params} level parameters + {len(norms)} norm factors "
-          f"= {total} free parameters")
+    print(f"  {header}")
     print()
     print("Free parameters discovered:")
-    for i, p in enumerate(params):
-        print(f"  [{i:3d}] {p.key():50s}  nominal = {values[i]:15.6g}  "
-              f"| {p.description()}")
-    for j, nf in enumerate(norms):
-        idx = n_level_params + j
-        print(f"  [{idx:3d}] {nf.key():50s}  nominal = {values[idx]:15.6g}  "
-              f"| {nf.description()}")
+    for line in summary_lines:
+        print(line)
 
 
-def cmd_run(
-    azr_filepath: str,
-    setup_filepath: str,
-    tmp_dir: str | None = None,
-):
-    """Run the Monte Carlo, collect distributions, compute quantiles."""
-    with open(setup_filepath, "r") as fh:
-        cfg = yaml.safe_load(fh) or {}
-
-    n_samples = cfg.get("n_samples", 100)
-    max_workers = cfg.get("max_workers", 4)
-    azure2_cmd = cfg.get("azure2_exe", "AZURE2")
-    if not shutil.which(azure2_cmd):
-        log.error("AZURE2 executable '%s' not found in PATH. "
-                  "Set 'azure2_exe' in setup YAML or install AZURE2.",
-                  azure2_cmd)
-        sys.exit(1)
-    use_brune = cfg.get("use_brune", True)
-    use_gsl = cfg.get("use_gsl", True)
-    seed = cfg.get("seed", 42)
-    keep_tmp = cfg.get("keep_tmp", False)
-    timeout = cfg.get("timeout", 600)
-    output_file = cfg.get("output_file", "mc_results.npz")
-    quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
-
-    # Load parameters from separate file
-    params_filepath = cfg.get("params_file", "mc_params.yaml")
-    # Resolve relative to setup file directory
-    if not os.path.isabs(params_filepath):
-        params_filepath = os.path.join(
-            os.path.dirname(os.path.abspath(setup_filepath)), params_filepath
-        )
-    with open(params_filepath, "r") as fh:
-        params_data = yaml.safe_load(fh) or {}
-    user_params = params_data.get("parameters", params_data)
-    defaults = params_data.get("defaults", {})
-    default_frac = defaults.get("fraction", 0.2)
-    default_dist = defaults.get("distribution", "uniform")
-
-    # Parse .azr
-    contents = read_input_file(azr_filepath)
-    params, norms, addresses = discover_free_parameters(contents)
-    nominals_list = get_input_values(contents, params, norms, addresses)
-    nominals = np.array(nominals_list)
-    levels = read_levels(contents)
-    extrap_files = get_extrap_output_files(contents)
-    n_level = len(params)
-
-    log.info("Parsed %s", azr_filepath)
-    log.info("  %d level params + %d norm factors = %d free",
-             n_level, len(norms), len(nominals))
-    log.info("  Extrap output files: %s", extrap_files)
-
-    # Build per-parameter range dicts
-    all_keys = [p.key() for p in params] + [nf.key() for nf in norms]
-
-    # Validate parameter keys match between .azr and YAML
+def _build_ranges(all_keys, nominals, user_params, default_frac, default_dist):
+    """Per-parameter (low, high, distribution, ...) dicts, merging the
+    discovered nominals with user-supplied ranges from mc_params.yaml."""
     discovered_keys = set(all_keys)
     yaml_keys = set(user_params.keys())
     extra = yaml_keys - discovered_keys
     missing = discovered_keys - yaml_keys
     if extra:
-        log.warning("Params in YAML not found in .azr (ignored): %s",
+        log.warning("Params in YAML not found in the model (ignored): %s",
                     sorted(extra))
     if missing:
-        log.warning("Params in .azr not found in YAML (using defaults): %s",
+        log.warning("Params in the model not found in YAML (using defaults): %s",
                     sorted(missing))
 
     ranges: list[dict] = []
@@ -210,14 +223,48 @@ def cmd_run(
             r = {"low": nom - half, "high": nom + half,
                  "distribution": default_dist}
         ranges.append(r)
+    return ranges
 
-    # Sampling
+
+def _sample_all_theta(nominals, ranges, n_samples, seed):
     rng = np.random.default_rng(seed)
     all_theta = np.empty((n_samples, len(nominals)))
     for i in range(n_samples):
         all_theta[i] = sample_theta(nominals, ranges, rng)
+    return all_theta
 
-    # Tempdir
+
+def _run_legacy(azr_filepath, cfg, user_params, default_frac, default_dist,
+                 n_samples, max_workers, seed, tmp_dir):
+    """Legacy engine: one AZURE2 --no-gui subprocess per sample."""
+    azure2_cmd = cfg.get("azure2_exe", "AZURE2")
+    if not shutil.which(azure2_cmd):
+        log.error("AZURE2 executable '%s' not found in PATH. "
+                  "Set 'azure2_exe' in setup YAML or install AZURE2.",
+                  azure2_cmd)
+        sys.exit(1)
+    use_brune = cfg.get("use_brune", True)
+    use_gsl = cfg.get("use_gsl", True)
+    keep_tmp = cfg.get("keep_tmp", False)
+    timeout = cfg.get("timeout", 600)
+
+    contents = read_input_file(azr_filepath)
+    params, norms, addresses = discover_free_parameters(contents)
+    nominals_list = get_input_values(contents, params, norms, addresses)
+    nominals = np.array(nominals_list)
+    levels = read_levels(contents)
+    extrap_files = get_extrap_output_files(contents)
+    n_level = len(params)
+
+    log.info("Parsed %s (engine=legacy)", azr_filepath)
+    log.info("  %d level params + %d norm factors = %d free",
+             n_level, len(norms), len(nominals))
+    log.info("  Extrap output files: %s", extrap_files)
+
+    all_keys = [p.key() for p in params] + [nf.key() for nf in norms]
+    ranges = _build_ranges(all_keys, nominals, user_params, default_frac, default_dist)
+    all_theta = _sample_all_theta(nominals, ranges, n_samples, seed)
+
     if tmp_dir is None:
         import tempfile
         base_tmp = tempfile.mkdtemp(prefix="azure_mc_")
@@ -226,11 +273,10 @@ def cmd_run(
         os.makedirs(base_tmp, exist_ok=True)
     log.info("Temporary workspace: %s", base_tmp)
 
-    log.info("Launching %d runs (%d workers) ...", n_samples, max_workers)
+    log.info("Launching %d runs (%d workers, engine=legacy) ...", n_samples, max_workers)
     results_dict: dict[int, dict[str, np.ndarray]] = {}
     n_failed = 0
 
-    # Signal handling for graceful shutdown
     shutdown_requested = False
     def _handle_shutdown(signum, frame):
         nonlocal shutdown_requested
@@ -290,21 +336,104 @@ def cmd_run(
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
 
-    log.info("Done: %d/%d succeeded, %d failed",
+    log.info("Legacy run done: %d/%d succeeded, %d failed",
              len(results_dict), n_samples, n_failed)
 
-    if not results_dict:
-        log.error("No successful runs — cannot produce output.")
-        if not keep_tmp:
-            shutil.rmtree(base_tmp, ignore_errors=True)
-        return
+    if not keep_tmp:
+        shutil.rmtree(base_tmp, ignore_errors=True)
 
-    # ------------------------------------------------------------------
-    # Assemble per-channel bucket arrays.
-    # Each run returns (n_pts, 3) per channel: [energy, xs, sfactor].
-    # Build two buckets per channel — one for cross section, one for
-    # S-factor — then compute quantiles and write output files.
-    # ------------------------------------------------------------------
+    return results_dict, all_theta, all_keys, nominals
+
+
+def _run_pyazr(azr_filepath, cfg, user_params, default_frac, default_dist,
+               n_samples, max_workers, seed):
+    """pyazr engine: one persistent AZURE2 API session, dispatched across a
+    thread pool (socket I/O releases the GIL, so threads are enough — no
+    per-sample process spawn or file writes)."""
+    azure2_binary = cfg.get("azure2_binary") or None
+    pyazr_path = cfg.get("pyazr_path") or None
+    cwd = cfg.get("cwd") or None
+    timeout = cfg.get("timeout", 1800)
+    nprocs = max(1, int(max_workers))
+
+    try:
+        azr = pyazr_adapter.open_session(
+            azr_filepath, nprocs=nprocs, binary=azure2_binary, cwd=cwd,
+            timeout=timeout, pyazr_path=pyazr_path)
+    except pyazr_adapter.PyazrUnavailableError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
+    try:
+        free_params = pyazr_adapter.list_free_parameters(azr)
+        nominals = np.array([fp.nominal for fp in free_params])
+        all_keys = [fp.key for fp in free_params]
+
+        log.info("Parsed %s (engine=pyazr)", azr_filepath)
+        log.info("  %d free parameters", len(free_params))
+
+        ranges = _build_ranges(all_keys, nominals, user_params, default_frac, default_dist)
+        all_theta = _sample_all_theta(nominals, ranges, n_samples, seed)
+
+        log.info("Launching %d runs (%d AZURE2 instances, engine=pyazr) ...",
+                 n_samples, nprocs)
+        results_dict: dict[int, dict[str, np.ndarray]] = {}
+        n_failed = 0
+
+        shutdown_requested = False
+        def _handle_shutdown(signum, frame):
+            nonlocal shutdown_requested
+            shutdown_requested = True
+            log.warning("Shutdown requested (signal %d), finishing current runs...", signum)
+
+        old_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
+        old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
+
+        try:
+            with ThreadPoolExecutor(max_workers=nprocs) as executor:
+                futures = {}
+                for i in range(n_samples):
+                    fut = executor.submit(
+                        pyazr_adapter.evaluate_sample, azr, free_params,
+                        all_theta[i], i % nprocs,
+                    )
+                    futures[fut] = i
+
+                for fut in as_completed(futures):
+                    run_id = futures[fut]
+                    try:
+                        data = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        n_failed += 1
+                        log.warning("  Run %d: %s", run_id, exc)
+                    else:
+                        results_dict[run_id] = data
+                    done = len(results_dict) + n_failed
+                    if done % max(1, n_samples // 20) == 0:
+                        log.info("  Progress: %d/%d  (%d ok, %d failed)",
+                                 done, n_samples, len(results_dict), n_failed)
+                    if shutdown_requested:
+                        log.warning("Cancelling remaining %d runs...",
+                                    n_samples - done)
+                        for pending in futures:
+                            pending.cancel()
+                        break
+        finally:
+            signal.signal(signal.SIGINT, old_sigint)
+            signal.signal(signal.SIGTERM, old_sigterm)
+
+        log.info("pyazr run done: %d/%d succeeded, %d failed",
+                 len(results_dict), n_samples, n_failed)
+        return results_dict, all_theta, all_keys, nominals
+    finally:
+        azr.close()
+
+
+def _aggregate_and_write(results_dict, all_theta, all_keys, nominals,
+                          quantiles_list, output_file):
+    """Assemble per-channel bucket arrays, compute quantiles, write
+    .npz/.dat outputs. Shared by every engine — each run returns
+    (n_pts, 3) per channel: [energy, xs, sfactor]."""
     sorted_ids = sorted(results_dict.keys())
     n_ok = len(sorted_ids)
 
@@ -392,8 +521,63 @@ def cmd_run(
     log.info("Saved %s  (%d channels, %d runs)", output_file,
              len(channel_names), n_ok)
 
-    if not keep_tmp:
-        shutil.rmtree(base_tmp, ignore_errors=True)
+
+def cmd_run(
+    azr_filepath: str,
+    setup_filepath: str,
+    tmp_dir: str | None = None,
+    engine_override: str | None = None,
+):
+    """Run the Monte Carlo, collect distributions, compute quantiles.
+
+    ``engine`` (from the setup YAML, or ``engine_override``) selects the
+    execution backend: ``pyazr`` (default) opens one persistent AZURE2 API
+    session and dispatches samples across a thread pool; ``legacy`` spawns
+    one ``AZURE2 --no-gui`` subprocess per sample, matching azure_mc's
+    original behavior.
+    """
+    with open(setup_filepath, "r") as fh:
+        cfg = yaml.safe_load(fh) or {}
+
+    engine = engine_override or cfg.get("engine", DEFAULT_ENGINE)
+    n_samples = cfg.get("n_samples", 100)
+    max_workers = cfg.get("max_workers", 4)
+    seed = cfg.get("seed", 42)
+    output_file = cfg.get("output_file", "mc_results.npz")
+    quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
+
+    # Load parameters from separate file
+    params_filepath = cfg.get("params_file", "mc_params.yaml")
+    # Resolve relative to setup file directory
+    if not os.path.isabs(params_filepath):
+        params_filepath = os.path.join(
+            os.path.dirname(os.path.abspath(setup_filepath)), params_filepath
+        )
+    with open(params_filepath, "r") as fh:
+        params_data = yaml.safe_load(fh) or {}
+    user_params = params_data.get("parameters", params_data)
+    defaults = params_data.get("defaults", {})
+    default_frac = defaults.get("fraction", 0.2)
+    default_dist = defaults.get("distribution", "uniform")
+
+    if engine == "legacy":
+        results_dict, all_theta, all_keys, nominals = _run_legacy(
+            azr_filepath, cfg, user_params, default_frac, default_dist,
+            n_samples, max_workers, seed, tmp_dir)
+    elif engine == "pyazr":
+        results_dict, all_theta, all_keys, nominals = _run_pyazr(
+            azr_filepath, cfg, user_params, default_frac, default_dist,
+            n_samples, max_workers, seed)
+    else:
+        log.error("Unknown engine '%s' (expected 'legacy' or 'pyazr')", engine)
+        sys.exit(1)
+
+    if not results_dict:
+        log.error("No successful runs — cannot produce output.")
+        return
+
+    _aggregate_and_write(results_dict, all_theta, all_keys, nominals,
+                         quantiles_list, output_file)
 
 
 def cmd_recompute_quantiles(

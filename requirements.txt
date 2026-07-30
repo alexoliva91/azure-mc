@@ -1,2 +1,8 @@
 numpy
 pyyaml
+
+# 'pyazr' (the pyazr engine's AZURE2 API client) is NOT installable from
+# PyPI. It ships inside an AZURE2 dev-branch checkout as a plain package
+# directory (<repo>/pyazr) and must be made importable yourself: either add
+# its parent directory to PYTHONPATH, or set 'pyazr_path' in mc_setup.yaml
+# (or pass --pyazr-path) to point at it. See README.md#execution-engines.
