@@ -290,7 +290,7 @@ def cmd_run(
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
 
     # Load parameters from separate file
-    params_filepath = cfg.get("params_file", "parameters.yaml")
+    params_filepath = cfg.get("params_file", "params.yaml")
     # Resolve relative to setup file directory
     if not os.path.isabs(params_filepath):
         params_filepath = os.path.join(
@@ -705,7 +705,7 @@ def cmd_mcmc(
 ):
     """Run MCMC with *emcee* using AZURE2 χ² as the likelihood.
 
-    The parameters in ``parameters.yaml`` are used as priors.
+    The parameters in ``params.yaml`` are used as priors.
     AZURE2 is invoked in *Calculate With Data* mode (choice 1) to
     evaluate the likelihood at each walker position proposed by emcee.
     """
@@ -748,7 +748,7 @@ def cmd_mcmc(
     progress = cfg.get("progress", True)
 
     # ---- load parameter ranges ----
-    params_filepath = cfg.get("params_file", "parameters.yaml")
+    params_filepath = cfg.get("params_file", "params.yaml")
     if not os.path.isabs(params_filepath):
         params_filepath = os.path.join(
             os.path.dirname(os.path.abspath(setup_filepath)), params_filepath
@@ -952,10 +952,18 @@ def cmd_mcmc_extrapolate(
         sys.exit(1)
     use_brune = cfg.get("use_brune", True)
     use_gsl = cfg.get("use_gsl", True)
-    max_workers = cfg.get("max_workers", 4)
+    max_workers = cfg.get("max_workers", os.cpu_count())
+    azure_threads = cfg.get("azure_threads", 1)
+
+    # Resolve 'auto' values
+    cpu_count = os.cpu_count() or 1
+    max_workers, azure_threads = _resolve_auto_parallelism(
+        max_workers, azure_threads, cpu_count
+    )
+
     seed = cfg.get("seed", 42)
     keep_tmp = cfg.get("keep_tmp", False)
-    timeout = cfg.get("timeout", 600)
+    timeout = cfg.get("timeout", 0)
     quantiles_list = cfg.get("quantiles", [0.16, 0.50, 0.84])
     output_file = cfg.get("extrapolate_output_file", "mcmc_extrapolate.npz")
 
@@ -1007,6 +1015,8 @@ def cmd_mcmc_extrapolate(
     # ---- run extrapolations ----
     log.info("Launching %d extrapolation runs (%d workers) ...",
              n_draws, max_workers)
+    log.info("Parallelism: %d workers × %d Azure threads = %d total threads",
+             max_workers, azure_threads, max_workers * azure_threads)
 
     results_dict: dict[int, dict[str, np.ndarray]] = {}
     n_failed = 0
@@ -1038,6 +1048,7 @@ def cmd_mcmc_extrapolate(
                     extrap_files, azure2_cmd, use_brune, use_gsl,
                     base_tmp, keep_tmp, timeout,
                     norm_updates=norm_updates,
+                    azure_threads=azure_threads,
                 )
                 futures[fut] = i
 
