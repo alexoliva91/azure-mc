@@ -16,7 +16,9 @@ from .constants import (
     ENERGY_INDEX,
     WIDTH_INDEX,
     CHANNEL_RADIUS_INDEX,
+    DATA_ISDIFF_INDEX,
     DATA_NORM_FACTOR_INDEX,
+    DATA_VARY_NORM_INDEX,
     OUTPUT_DIR_INDEX,
 )
 from .models import Level
@@ -63,6 +65,19 @@ def read_data_segments(contents: list[str]):
         if row.strip():
             segments.append(row.split())
     return segments
+
+
+def data_norm_indices(seg_tokens: list[str]) -> tuple[int, int]:
+    """(dataNorm, varyNorm) token indices for a <segmentsData> row.
+
+    Normally these sit at DATA_NORM_FACTOR_INDEX/DATA_VARY_NORM_INDEX, but a
+    phase-shift segment (isDiff == 2) carries two extra fields (phaseJ,
+    phaseL) right after isDiff, shifting everything after them two columns
+    later -- see AZURE2's SegLine.h.
+    """
+    is_diff = int(float(seg_tokens[DATA_ISDIFF_INDEX]))
+    offset = 2 if is_diff == 2 else 0
+    return DATA_NORM_FACTOR_INDEX + offset, DATA_VARY_NORM_INDEX + offset
 
 
 def read_test_segments(contents: list[str]):
@@ -143,7 +158,8 @@ def write_input_file(
                     line = contents[line_idx]
                     leading = line[:len(line) - len(line.lstrip())]
                     parts = re.split(r'(\s+)', line.lstrip())
-                    _replace_token(parts, DATA_NORM_FACTOR_INDEX,
+                    norm_idx, _ = data_norm_indices(line.split())
+                    _replace_token(parts, norm_idx,
                                    str(norm_dict[data_row_idx]))
                     contents[line_idx] = leading + ''.join(parts)
                 data_row_idx += 1

@@ -6,9 +6,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .constants import DATA_NORM_FACTOR_INDEX, DATA_VARY_NORM_INDEX
 from .models import Level, Parameter, NormFactor
-from .io import read_levels, read_data_segments
+from .io import read_levels, read_data_segments, data_norm_indices
 
 
 def discover_free_parameters(
@@ -68,8 +67,9 @@ def discover_free_parameters(
     norm_factors: list[NormFactor] = []
     data_segs = read_data_segments(contents)
     for idx, seg in enumerate(data_segs):
-        if len(seg) > DATA_VARY_NORM_INDEX:
-            vary = int(seg[DATA_VARY_NORM_INDEX])
+        _, vary_idx = data_norm_indices(seg)
+        if len(seg) > vary_idx:
+            vary = int(float(seg[vary_idx]))
             if vary:
                 norm_factors.append(NormFactor(idx))
 
@@ -89,7 +89,8 @@ def get_input_values(
         values.append(getattr(levels[gi][ri], kind))
     data_segs = read_data_segments(contents)
     for nf in norm_factors:
-        values.append(float(data_segs[nf.index][DATA_NORM_FACTOR_INDEX]))
+        norm_idx, _ = data_norm_indices(data_segs[nf.index])
+        values.append(float(data_segs[nf.index][norm_idx]))
     return values
 
 

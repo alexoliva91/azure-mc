@@ -186,26 +186,35 @@ def evaluate_sample(azr, free_params: list[FreeParam], theta: np.ndarray,
     name (e.g. several energy ranges of the same reaction) are concatenated
     and sorted by energy, mirroring how the legacy ``.extrap`` files
     aggregate all segments of a channel into one file.
+
+    Calls the AZURE2 API directly (``UPDATE_SEGMENTS`` once, then
+    ``GET_CALCULATED_ENERGIES``/``GET_CALCULATED_SEGMENT``/
+    ``GET_CALCULATED_CONV`` per segment) rather than pyazr's
+    ``calculate``/``calculate_sfactor``/``calculate_energies``
+    convenience methods, each of which re-issues ``UPDATE_SEGMENTS`` and
+    so would otherwise re-run the full R-matrix calculation three times
+    for one sample.
     """
     x = np.array(azr.params, dtype=float)
     for fp, value in zip(free_params, theta):
         x[fp.index] = float(value)
 
-    energies = azr.calculate_energies(x, proc=proc)
-    cross = azr.calculate(x, proc=proc)
-    sfactor = azr.calculate_sfactor(x, proc=proc)
+    client = azr.clients[proc]
+    nsegments = int(client.communicate("UPDATE_SEGMENTS", x)[0])
 
     segments = _active_test_segments(azr)
-    n = len(segments)
-    if not (len(energies) == len(cross) == len(sfactor) == n):
+    if len(segments) != nsegments:
         raise RuntimeError(
-            f"pyazr returned {len(energies)}/{len(cross)}/{len(sfactor)} "
-            f"calculated segments but the model declares {n} active "
-            f"extrapolation segments."
+            f"pyazr calculated {nsegments} segments but the model declares "
+            f"{len(segments)} active extrapolation segments."
         )
 
     by_channel: dict[str, list[np.ndarray]] = {}
-    for seg, e, xs, sf in zip(segments, energies, cross, sfactor):
+    for i, seg in enumerate(segments):
+        e = client.communicate("GET_CALCULATED_ENERGIES", [i])
+        xs = client.communicate("GET_CALCULATED_SEGMENT", [i])
+        conv = client.communicate("GET_CALCULATED_CONV", [i])
+        sf = xs * conv
         name = channel_name_for_segment(seg)
         arr = np.column_stack([np.asarray(e), np.asarray(xs), np.asarray(sf)])
         by_channel.setdefault(name, []).append(arr)
